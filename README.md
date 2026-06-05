@@ -54,15 +54,17 @@ huggingface-cli download divelab/opdlm_train_data --local-dir data/ --repo-type 
 code (TACO / KodCode-Light-RL / AceCode), math (DAPO, Nemotron-v2-Math), STEM
 (Nemotron-v2-STEM) and chat (Nemotron-v2-Chat).
 
-Two paper datasets are **not** in the OPDLM collection and need separate steps:
+One paper dataset is **not** in the OPDLM collection and needs a separate step:
 
 ```bash
 # Codeforces (paper eval) — built from open-r1/codeforces (verifiable subset)
 python data/prepare_codeforces.py
-
-# DAPO_Math_17k (used by scripts/post_train_dapo/*)
-huggingface-cli download BytedTsinghua-SIA/DAPO-Math-17k --local-dir data/ --repo-type dataset
 ```
+
+The math post-training data (`MATH_train_traceRL.json`, Hendrycks MATH
+level 3-5, ~8K hard tasks, following the traceRL setup) is bundled in
+the `divelab/opdlm_eval_data` repo and is already downloaded by the
+step above.
 
 See [`data/readme.md`](data/readme.md) for per-dataset details.
 
@@ -110,7 +112,8 @@ the 0.6B / 1.7B scales and restricted to the teacher's **top-16 tokens**
 |-------|----------|
 | OPDLM 0.6B / 1.7B (full-vocab KL, opdlm_train)        | `scripts/general_pre_train/BD3LM_{06B,17B}.sh` |
 | OPDLM 4B / 8B (top-16 sparse KL, opdlm_train)         | `scripts/general_pre_train/BD3LM_{4B,8B}.sh` |
-| OPDLM-MATH training (DAPO_Math_17k, math-only)        | `scripts/post_train_dapo/DAPO_OPD_{0.6B,4B}/BD3LM_DAPO_*.sh` |
+| OPDLM-MATH 4B / 8B, non-thinking (MATH_train_traceRL) | `scripts/post_train_math/BD3LM_MATH_{4B,8B}.sh` |
+| OPDLM-MATH 4B / 8B, thinking-on (MATH_train_traceRL)  | `scripts/post_train_math/BD3LM_MATH_{4B,8B}_thinking.sh` |
 
 Dynamic-threshold remasking is an **inference-time** choice (see Section 5);
 the launchers above all train with `dynamic_threshold_schedule.enabled=False`.
@@ -180,10 +183,8 @@ shard the generation across GPUs.
 | T1 — Main (4B/8B)              | Train + eval | `general_pre_train/BD3LM_{4B,8B}.sh` → `pure_inference/run_eval_greedy_{4B,8B}_base.sh` |
 | T2 — Zero-shot think           | Eval         | `run_eval_greedy_{4B,8B}_base.sh --enable_thinking` |
 | T3 — Multilingual              | Eval         | `run_eval_greedy_{4B,8B}_base.sh` on MMMLU-lite / INCLUDE-lite / MT-AIME2024 / MLogiQA |
-| T5 — OPDLM-MATH vs TraDo       | Train + eval | `post_train_dapo/DAPO_OPD_4B/BD3LM_DAPO_4B_to_4B.sh` (and the missing 8B-from-8B variant — copy and edit the scale paths) |
+| T5 — OPDLM-MATH vs TraDo       | Train + eval | `post_train_math/BD3LM_MATH_{4B,8B}.sh` (non-thinking) and `BD3LM_MATH_{4B,8B}_thinking.sh` (thinking-on) |
 | T6 — Smaller scales (0.6B/1.7B) | Train + eval | `general_pre_train/BD3LM_{06B,17B}.sh` → `run_eval_greedy_{06B,17B}_base.sh` |
-| T7 — Teacher size on 4B/8B math | Train       | `post_train_dapo/DAPO_OPD_4B/BD3LM_DAPO_{4B,32B}_to_4B.sh` (and missing `..._to_8B.sh` variants) |
-| T8 — Teacher size on 0.6B math  | Train       | `post_train_dapo/DAPO_OPD_0.6B/BD3LM_DAPO_4B_to_06B.sh` (and missing `..._06B_to_06B.sh` variant) |
 | Figures 3-7 — decoding sweeps   | Eval        | `run_eval_greedy_4B_base_{dynamic,fix_thres}.sh` |
 
 ---
