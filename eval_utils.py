@@ -11,6 +11,14 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "reward"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "reward"))
 
+from domain_reward import (                          # noqa: E402
+    extract_mmlu_pro_letter,                         # used by MMLU_Pro_sdar
+    extract_humanevalx_python,                       # used by HumanEvalX_python_sdar
+    extract_humaneval_sdar,                          # used by HumanEval_sdar
+    extract_mc_oc,                                   # SDAR first_option_postprocess; used by ARC_C_sdar / MMLU_sdar
+    # IFEval_sdar uses domain="ifeval_oc" → dispatched via CHECKERS["ifeval_oc"]
+    # = check_ifeval_oc (SDAR vendored IFEvaluator). No direct import needed.
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -44,6 +52,46 @@ def _lmb_template(data_i, question):
     return tmpl.format(question=question)
 
 
+# MMLU 5-shot — SDAR's `mmlu_gen_4d595a.py` builds the prompt as
+#   <hint>\nQuestion: <q>\nA. {A}\nB. ...\nD. {D}\nAnswer: <gold>\n\n
+#   ... (×5 dev examples from FixKRetriever[0:5]) ...
+#   <hint>\nQuestion: <test_q>\nA. ...\nD. ...\nAnswer:
+# The hint is per-subject. Dev examples live in `data/MMLU_sdar_5shot.json`
+# (loaded once and cached). Each test row in MMLU_sdar.json carries
+# `question, A, B, C, D, subject` so this builder runs at eval time.
+_MMLU_HINT = ("There is a single choice question about {subject}. "
+              "Answer the question by replying A, B, C or D.")
+_MMLU_5SHOT_CACHE = None
+
+
+def _get_mmlu_5shot():
+    global _MMLU_5SHOT_CACHE
+    if _MMLU_5SHOT_CACHE is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "data", "MMLU_sdar_5shot.json")
+        with open(path) as f:
+            _MMLU_5SHOT_CACHE = json.load(f)
+    return _MMLU_5SHOT_CACHE
+
+
+# MBPP_sdar — SDAR's `sanitized_mbpp_mdblock_0shot_nocot_gen_a2e416.py` prompt.
+# The test_list is INSIDE the prompt by design (gives the model 3 assert
+# statements to satisfy). Per-row dispatch via this callable so the test
+# assertions stay in the JSON `test_list` field, not baked into question.
+_MBPP_SDAR_PROMPT = (
+    "You are an expert Python programmer, and here is your task:\n"
+    "{text}\n"
+    "Your code should pass these tests:\n\n"
+    "{test_list}\n"
+    " You should submit your final solution in the following format: ```python\n\n```"
+)
+
+
+def _mbpp_sdar_template(data_i, question):
+    test_list = "\n".join(data_i.get("test_list", []))
+    return _MBPP_SDAR_PROMPT.format(text=question, test_list=test_list)
+
+
 def _triviaqa_template(data_i, question):
     """SDAR triviaqa_wiki_1shot_gen_bc5f21 prompt as a multi-turn chat list.
 
@@ -60,6 +108,40 @@ def _triviaqa_template(data_i, question):
         {"role": "user", "content": f"Q: {question}"},
     ]
 
+
+def _mmlu_template(data_i, question):
+    """SDAR mmlu_gen_4d595a 5-shot direct-letter prompt, per-subject hint.
+
+    Returns a list of {role, content} chat messages so that OpenCompass-style
+    in-context examples are sent as separate USER/ASSISTANT turns rather than
+    inlined as text in a single user turn — this matches the way Qwen3 Chat
+    saw few-shot data during instruction tuning. Earlier inline-text version
+    underperformed by ~3pp; multi-turn closes most of that.
+
+    The rollout's `_build_prompt_from_template` accepts either a string or a
+    list of dicts and routes accordingly.
+    """
+    subj = data_i.get("subject", "")
+    hint = _MMLU_HINT.format(subject=subj.replace("_", " "))
+    messages = []
+    for ex in _get_mmlu_5shot().get(subj, []):
+        messages.append({
+            "role": "user",
+            "content": (
+                f"{hint}\nQuestion: {ex['q']}\n"
+                f"A. {ex['A']}\nB. {ex['B']}\nC. {ex['C']}\nD. {ex['D']}\nAnswer:"
+            ),
+        })
+        messages.append({"role": "assistant", "content": ex["gold"]})
+    messages.append({
+        "role": "user",
+        "content": (
+            f"{hint}\nQuestion: {question}\n"
+            f"A. {data_i.get('A','')}\nB. {data_i.get('B','')}\n"
+            f"C. {data_i.get('C','')}\nD. {data_i.get('D','')}\nAnswer:"
+        ),
+    })
+    return messages
 
 # ═══════════════════════════════════════════════════════════════════════
 # GSM8K: dllm/lm-evaluation-harness gsm8k-cot.yaml
@@ -219,7 +301,7 @@ def extract_lcb_code(text, data_i=None):
 # `prompt_template`:
 #   - a format string with `{question}` → applied by the rollout scripts
 #   - `None` → question is used as-is (prompt already encoded in the sample,
-#     e.g. opdlm_train where each question already has a domain-specific
+#     e.g. Hybrid_train where each question already has a domain-specific
 #     prefix like "Solve the following science problem...").
 DATASET_CONFIGS = {
     # ── math ──────────────────────────────────────────────────────────
@@ -458,6 +540,66 @@ DATASET_CONFIGS = {
         "dllm_max_new_tokens": 1024,
         "dllm_steps_per_block": 32,
     },
+    # # ───── SDAR-spec code variants (separate entries; see data/readme.md) ─────
+    # # HumanEval_sdar — same 164 task IDs as our HumanEval entry; SDAR's prompt
+    # # is a plain instruction (no evalplus assistant-prefill). Reuses
+    # # HumanEval.json. Scoring: defer_scoring="evalplus" gives us the canonical
+    # # base pass@1 (which is what SDAR's HumanEvalEvaluator computes).
+    # # Source: humaneval_openai_sample_evals_gen_dcae0e.py
+    # "HumanEval_sdar": {
+    #     "path": "HumanEval.json",
+    #     "domain": "code",
+    #     "prompt_template": (
+    #         "Read the following function signature and docstring, and fully "
+    #         "implement the function described. Your response should only "
+    #         "contain the code for this function.\n{question}"
+    #     ),
+    #     # Custom extractor prepends the prompt (imports + signature + docstring)
+    #     # so evalplus.sanitize sees a self-contained program. Without this,
+    #     # SDAR-style chat responses often omit `from typing import List` and
+    #     # fail at test-time with NameError. Mirrors what SDAR's
+    #     # `human_eval.evaluate_functional_correctness` does internally.
+    #     "extract": extract_humaneval_sdar,
+    #     "defer_scoring": "evalplus",
+    #     "evalplus_dataset": "humaneval",
+    #     "dllm_max_new_tokens": 1024,
+    #     "dllm_steps_per_block": 32,
+    # },
+    # # MBPP_sdar — sanitized MBPP (427 tasks; NOT MBPP+ 378). Different data,
+    # # different prompt: SDAR includes 3 assert statements from `test_list`
+    # # inside the prompt itself (gives the model the spec). Callable
+    # # `_mbpp_sdar_template` assembles the test_list at eval time.
+    # # Scoring uses the existing function-eval path (`evaluate_function_dataset`
+    # # in reward/rl_execute.py): each row's `test_list` (3 asserts) is exec'd
+    # # against the model's extracted code in a sandboxed subprocess.
+    # # Source: sanitized_mbpp_mdblock_0shot_nocot_gen_a2e416.py
+    # "MBPP_sdar": {
+    #     "path": "MBPP_sdar.json",
+    #     "domain": "code",
+    #     "prompt_template": _mbpp_sdar_template,
+    #     "dllm_max_new_tokens": 512,           # SDAR uses max_out_len=512
+    #     "dllm_steps_per_block": 32,
+    # },
+    # # HumanEvalX_python_sdar — Python subset of CodeGeeX2/HumanEvalX (164 tasks,
+    # # task_id "Python/0".."Python/163"; same problems as HumanEval but a
+    # # different schema). SDAR's prompt is just `{question}` verbatim — pure
+    # # signature+docstring with no instruction. Multi-language (cpp/go/java/js)
+    # # is NOT included; SDAR scores those via a Docker code-eval server which
+    # # we don't set up here.
+    # # Custom extractor `extract_humanevalx_python`: prepends the signature
+    # # to the model's body when needed (the model often emits only the body
+    # # since the prompt is bare signature+docstring with no instruction).
+    # # Scoring via the function-eval path: each row's `test_list` is
+    # # `[<test_block>\ncheck(<entry_point>)]` (built by process_code_sdar.py).
+    # # Source: humanevalx_gen_620cfa.py (python subset only)
+    # "HumanEvalX_python_sdar": {
+    #     "path": "HumanEvalX_python_sdar.json",
+    #     "domain": "code",
+    #     "prompt_template": "{question}",
+    #     "extract": extract_humanevalx_python,
+    #     "dllm_max_new_tokens": 1024,
+    #     "dllm_steps_per_block": 32,
+    # },
     # LiveCodeBench v5 / v6 (date-filtered windows; see prepare_lcb_data.py):
     #   - chat_style "lcb": system message (SYSTEM_MESSAGE_GENERIC) + pre-baked
     #     canonical user prompt. No assistant prefill; model generates the full
@@ -485,7 +627,25 @@ DATASET_CONFIGS = {
         "dllm_max_new_tokens": 4096,
         "dllm_steps_per_block": 32,
     },
+    # # LCB_v6_sdar — same data + same chat_style ("lcb" → SYSTEM_MESSAGE_GENERIC
+    # # which is byte-identical to SDAR's), so it's effectively an alias of
+    # # LCB_v6. The only thing that distinguishes "SDAR-style" is sampling:
+    # # SDAR runs `n=6` (6 samples per question, computes pass@k). Set this in
+    # # the runner script via `--num_response_per_task 6`, not here.
+    # # Source: livecodebench_v6_academic.py
+    # "LCB_v6_sdar": {
+    #     "path": "LCB_v6.json",
+    #     "domain": "code",
+    #     "chat_style": "lcb",
+    #     "defer_scoring": "livecodebench",
+    #     "extract": extract_lcb_code,
+    #     "dllm_max_new_tokens": 4096,
+    #     "dllm_steps_per_block": 32,
+    # },
     # PrimeIntellect: Gen-Verse competitive-programming problems, 100% stdio.
+    # Prompt template matches dLLM-RL's trado stdio template verbatim
+    # (sample/trado_rl_rollout.py:346), so the KL distillation target matches
+    # the distribution the dLLM-RL teacher was trained under.
     # Scoring is skipped via dataset.skip_code_correctness=True in rl_bd3lm.yaml;
     # test_input/test_output fields are ignored at training time.
     "PrimeIntellect": {
@@ -518,17 +678,8 @@ DATASET_CONFIGS = {
         "dllm_max_new_tokens": 2048,
         "dllm_steps_per_block": 32,
     },
-    "LiveBench": {
-        "path": "LiveBench.json",
-        "domain": "code",
-        "prompt_template": (
-            "This is the problem:\n{question}\n"
-            "You should put your code in ```python ```. "
-            "Use input() to read input and print() to produce output in your script. "
-        ),
-        "dllm_max_new_tokens": 2048,
-        "dllm_steps_per_block": 32,
-    },
+    # NOTE: the active "LiveBench" entry (domain="livebench", multi-category)
+    # is defined ~300 lines below. An earlier code-domain stub was removed.
     # ── instruction following ─────────────────────────────────────────
     "IFEval": {
         "path": "IFEval.json",
@@ -537,6 +688,31 @@ DATASET_CONFIGS = {
         "dllm_max_new_tokens": 1280,
         "dllm_steps_per_block": 32,
     },
+    # ───────────────────────────────────────────────────────────────────
+    # SDAR-spec knowledge benchmarks (mirrors evaluation/opencompass/
+    # configs/datasets/<bench>/<canonical_config>.py).
+    # ───────────────────────────────────────────────────────────────────
+    # ARC-c — two prompt variants, same data + same scoring (`extract_mc` +
+    # letter-compare). Both read data/ARC_C.json (1,144 rows; question stem
+    # with options inlined as "A. text" — `reformat_choices=False`).
+    #
+    # ARC_C_sdar  : SDAR's `ARC_c_cot_gen_926652.py` — 0-shot CoT,
+    #               "ANSWER: $LETTER" output. Long generation budget.
+    # ARC_C       : Qwen-style direct-letter prompt (matches the existing
+    #               MMLU/MMLU_Redux entries). Short generation budget.
+    # "ARC_C_sdar": {
+    #     "path": "ARC_C.json",
+    #     "domain": "mc",
+    #     "extract": extract_mc_oc,            # SDAR's first_option_postprocess('ABCD')
+    #     "prompt_template": (
+    #         "Answer the following multiple choice question. The last line of "
+    #         "your response should be of the following format: "
+    #         "'ANSWER: $LETTER' (without quotes) where LETTER is one of ABCD. "
+    #         "Think step by step before answering.\n\n{question}"
+    #     ),
+    #     "dllm_max_new_tokens": 2048,
+    #     "dllm_steps_per_block": 32,
+    # },
     "ARC_C": {
         "path": "ARC_C.json",
         "domain": "mc",
@@ -544,18 +720,103 @@ DATASET_CONFIGS = {
         "dllm_max_new_tokens": 3,
         "dllm_steps_per_block": 3,
     },
-    # TriviaQA — 1-shot wiki Q→A, short answer. The 1-shot anchor (train[0]:
-    # "Where in England was Dame Judi Dench born?" / "York") is sent as a
-    # separate USER/ASSISTANT turn so the test question is unambiguous (see
-    # _triviaqa_template above). Custom domain triggers extract_triviaqa +
-    # check_triviaqa (normalize + substring match).
+    # # MMLU 5-shot — direct-letter (no CoT). JSON rows store the raw question +
+    # # A,B,C,D + subject; `_mmlu_template` (above) loads the per-subject 5-shot
+    # # dev examples from `data/MMLU_sdar_5shot.json` and assembles the SDAR
+    # # prompt at eval time. Source: mmlu_gen_4d595a.py
+    # "MMLU_sdar": {
+    #     "path": "MMLU_sdar.json",
+    #     "domain": "mc",
+    #     "extract": extract_mc_oc,            # SDAR's first_option_postprocess('ABCD')
+    #     "prompt_template": _mmlu_template,   # returns list[dict] → multi-turn 5-shot
+    #     "dllm_max_new_tokens": 16,           # direct-letter; small budget is enough
+    #     "dllm_steps_per_block": 4,
+    # },
+    # # MMLU-Pro 0-shot CoT — A-P (up to 16 options). Custom regex extractor.
+    # # Source: mmlu_pro_0shot_cot_gen_08c1de.py
+    # "MMLU_Pro_sdar": {
+    #     "path": "MMLU_Pro_sdar.json",
+    #     "domain": "mc",
+    #     "extract": extract_mmlu_pro_letter,   # SDAR's match_answer_pattern A-P
+    #     "prompt_template": (
+    #         "Answer the following multiple choice question. The last line of "
+    #         "your response should be of the following format: "
+    #         "'ANSWER: $LETTER' (without quotes) where LETTER is one of "
+    #         "Options(e.g. one of ABCDEFGHIJKLMNOP). Think step by step "
+    #         "before answering.\n\nQuestion:\n{question}"
+    #     ),
+    #     "dllm_max_new_tokens": 2048,
+    #     "dllm_steps_per_block": 32,
+    # },
+    # # GPQA-Diamond 0-shot — deterministic option-shuffle, "(A)..(D).." format.
+    # # Source: gpqa_gen_4baadb.py
+    # "GPQA_Diamond_sdar": {
+    #     "path": "GPQA_Diamond_sdar.json",
+    #     "domain": "mc",
+    #     "prompt_template": (
+    #         "What is the correct answer to this question: {question}\n"
+    #         "Format your response as follows: "
+    #         "\"The correct answer is (insert answer here)\""
+    #     ),
+    #     "dllm_max_new_tokens": 2048,
+    #     "dllm_steps_per_block": 32,
+    # },
+    # # IFEval — verbatim prompt (instruction is embedded), IFEvaluator scoring.
+    # # Source: IFEval_gen_353ae7.py.  (Same data as the existing IFEval entry;
+    # # _sdar variant exists only so file naming is consistent with the others.)
+    # "IFEval_sdar": {
+    #     "path": "IFEval_sdar.json",
+    #     # `ifeval_oc` is a separate domain → CHECKERS["ifeval_oc"] = check_ifeval_oc.
+    #     # A/B-tested against `check_ifeval` (lm_eval) on saved 1.7B rollouts:
+    #     # scores agreed within 1 row (187 vs 188 / 541). The swap is for
+    #     # source-of-truth alignment (SDAR's vendored copy + drops the
+    #     # lm_eval/langdetect dependency), not for the 9pp gap to SDAR's
+    #     # reported 43.4 — that residual is inference-engine drift
+    #     # (JetEngine vs HF), not scorer drift.
+    #     "domain": "ifeval_oc",
+    #     "prompt_template": None,
+    #     "dllm_max_new_tokens": 1280,
+    #     "dllm_steps_per_block": 32,
+    # },
+    # TriviaQA — 1-shot wiki Q→A, short answer. SDAR uses the wiki version
+    # (TriviaQADatasetV2 reading triviaqa-{train,validation}.jsonl) with
+    # FixKRetriever(fix_id_list=[0]) → the 1-shot anchor is always train[0]:
+    #     Q: "Where in England was Dame Judi Dench born?" / A: "York"
+    # Validation split (7993 rows) is the test set. Gold is a list of accepted
+    # aliases. Custom domain triggers extract_triviaqa + check_triviaqa
+    # (mirrors OpenCompass TriviaQAEvaluator: normalize + substring match).
+    # Source: triviaqa_wiki_1shot_gen_bc5f21.py
+    #
+    # Two entries share data/TriviaQA.json:
+    #   TriviaQA       — multi-turn callable; the 1-shot example is a separate
+    #                    USER/ASSISTANT turn so the test question is unambiguous.
+    #                    Use this for any new run.
+    #   TriviaQA_sdar  — string template that inlines both Q/A pairs in one
+    #                    user message. This matches the literal text SDAR's
+    #                    OpenCompass would assemble before the chat template,
+    #                    BUT chat-template-wrapping turns it into a single
+    #                    user turn that confuses the model into answering the
+    #                    example. Kept for backward-compat / SDAR-fidelity
+    #                    comparison.
     "TriviaQA": {
         "path": "TriviaQA.json",
         "domain": "triviaqa",
         "prompt_template": _triviaqa_template,    # multi-turn list[dict]
-        "dllm_max_new_tokens": 64,
+        "dllm_max_new_tokens": 64,                # SDAR uses max_out_len=50
         "dllm_steps_per_block": 8,
     },
+    # "TriviaQA_sdar": {
+    #     "path": "TriviaQA.json",
+    #     "domain": "triviaqa",
+    #     "prompt_template": (
+    #         "Q: Where in England was Dame Judi Dench born?\n"
+    #         "A: York.\n"
+    #         "Q: {question}\n"
+    #         "A: "
+    #     ),
+    #     "dllm_max_new_tokens": 64,
+    #     "dllm_steps_per_block": 8,
+    # },
     # ── MLogiQA (multilingual LogiQA, 10 langs × 80 = 800 rows) ───────
     # Source: swiss-ai/mlogiqa. Cited by Qwen3 in Multilingual Tasks.
     # 4-way MC; questions are LogiQA-style logical-reasoning puzzles
@@ -716,16 +977,28 @@ DATASET_CONFIGS = {
         "dllm_max_new_tokens": 4096,
         "dllm_steps_per_block": 32,
     },
-    # ── OPDLM training corpus (per-sample domain mix) ─────────────────
-    # Samples store the BARE problem in `question`; the prompt wrapper is
-    # picked per-sample from `per_domain_template` below using
-    # `data_i["domain"]`. For code, the front-loaded instruction (stdio or
-    # `Implement a function named X`) is already baked into the question by
-    # `scripts/rewrite_hybrid_train_new.py`, so code uses a pass-through.
-    "opdlm_train": {
-        "path": "opdlm_train.json",
+    # ── hybrid (per-sample domain mix) ────────────────────────────────
+    # Hybrid_train samples store the BARE problem in `question` (math/MC/code
+    # have been normalized by scripts/rewrite_hybrid_train.py). The actual
+    # prompt wrapper is picked per-sample from `per_domain_template` below,
+    # using `data_i["domain"]`. For code, the front-loaded instruction
+    # (stdio vs `Implement a function named X`) is already baked into the
+    # question by the rewrite — so code uses a pass-through template.
+    "Hybrid_train": {
+        "path": "Hybrid_train_new.json",
         "domain": None,                 # per-sample, resolved from data_i["domain"]
-        "prompt_template": None,        # dispatch via per_domain_template
+        "prompt_template": None,        # legacy global key — dispatch via per_domain_template
+        "per_domain_template": {
+            "math":    "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+            "science": "{question}\nPlease show your choice in the answer field with only the choice letter, e.g., \"answer\": \"C\".",
+            "code":    "{question}",    # instruction baked in (stdio or named-fn at front)
+            "chat":    "{question}",    # free-form, no wrapper
+        },
+    },
+    "Hybrid_train_new": {
+        "path": "Hybrid_train_new.json",
+        "domain": None,                 # per-sample, resolved from data_i["domain"]
+        "prompt_template": None,        # legacy global key — dispatch via per_domain_template
         "per_domain_template": {
             "math":    "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
             "science": "{question}\nPlease show your choice in the answer field with only the choice letter, e.g., \"answer\": \"C\".",

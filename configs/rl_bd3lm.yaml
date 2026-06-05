@@ -21,7 +21,7 @@ experiment:
     node_index: 0
 
 model:
-    pretrained_model: "/data484_2/xsu2/traceRL/pretrained_models/BD3LM/Qwen3-0.6B-a2d-init" # student model (BD3LM)
+    pretrained_model: "/data484_2/xsu2/traceRL/pretrained_models/BD3LM/Qwen3-0.6B-A2D-untrained-dllm-convert" # student model (BD3LM)
     teacher_model: "/data484_2/xsu2/traceRL/pretrained_models/Qwen/Qwen3-4B" # teacher model for distillation
     optimized_name: "optimized" # the output name for your optimized model, will be saved under sft_dream/ckpt
     model_base: "bd3lm"
@@ -33,7 +33,9 @@ dataset:
     train_dataset: "MATH_train" # "MATH_train""PrimeIntellect"
     optimization_data: "rl_data" # name of the rollout data output
     data_type: "math" # "math" "code"
-    skip_code_correctness: True  # True = skip subprocess code test runs during training (KL distillation: reward unused; saves ~5-20s/step on opdlm_train). Math/mc inline checks still run.
+    offline_data: null  # path to pre-collected data, e.g. "data/teacher_MATH_train_k4_correct.json"
+    sft_data: data/Qwen4B_offline/gsm8k_Qwen3-4B_sft.json  # path to teacher response JSON, e.g. "data/Qwen4B_offline/gsm8k_Qwen3-4B_sft.json"
+    skip_code_correctness: True  # True = skip subprocess code test runs during training (KL distillation: reward unused; saves ~5-20s/step on Hybrid_train). Math/mc inline checks still run.
     num_data_epochs: 1  # outer epochs over full training dataset (-1 = random sample each step, >=1 = sequential iteration with reshuffle)
 
 # also see explanations in eval configs
@@ -60,7 +62,7 @@ rollout:
     # synthetic. Use to A/B trajectory-based vs MDLM-style random-mask training.
     random_mask: false
     # Per-domain cap on max generation tokens. Only applied when a sample carries
-    # a `domain` field (e.g. opdlm_train). Effective per-sample max = min(rollout.max_token, cap).
+    # a `domain` field (e.g. Hybrid_train). Effective per-sample max = min(rollout.max_token, cap).
     # Absent/missing domain key -> no cap (uses rollout.max_token / schedule as-is).
     per_domain_max_token:
       math: 4096
@@ -94,7 +96,15 @@ training:
     use_kl_estimator_k3: True
     teacher_fill: "clean_fill" # "argmax_fill" or "clean_fill"
     exclude_im_end: True  # exclude <|im_end|> token from KL loss (useful when teacher disagrees with student stopping)
-    loss_type: "kl"  # forward KL only (OPDLM)
+    loss_type: "kl"  # "kl" (forward/reverse KL), "jsd" (Jensen-Shannon divergence), or "ppo" (PPO-clipped)
+    reverse_kl_weight: 0.0  # weight for reverse KL; total loss = (1-w)*KL(teacher||student) + w*KL(student||teacher)
+    jsd_alpha: 0.5  # JSD mixing: M = alpha*teacher + (1-alpha)*student; 0.5 = symmetric JSD
+    top_k_logits: 0  # 0 = full-vocab KL/JSD (current). >0 = Nemotron-style sparse KL restricted to teacher's top-K tokens (typical: 64).
+    sft_alpha: 0.0  # per-sample probability of using teacher response (0.0=pure on-policy, 1.0=pure off-policy)
+    sft_alpha_schedule: "constant"  # "constant", "linear_decay", "cosine"
+    sft_alpha_schedule_params:
+        end_step: 100  # step at which alpha reaches 0 (used by linear_decay, cosine)
+    dllm_style_sft: False  # match dllm SFT pipeline: append <|im_end|> to responses, pad response side with <|im_end|>, and train loss on all response positions (including im_end + eos padding) so the model learns to stop.
     student_arm_shift: False  # shift student logits right by 1 to align ARM next-token prediction to current-token convention (use when student starts from untrained ARM weights)
     zero_stage: 3  # DeepSpeed ZeRO stage for student (2 = params replicated on each GPU, no save-time gather; 3 = params sharded, requires gather on save)
     offload_optimizer_device: "cpu"  # "cpu" or "none". "none" keeps optimizer on GPU (faster, more VRAM)

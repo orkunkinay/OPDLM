@@ -298,7 +298,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
     uni_prompting = UniversalPrompting(tokenizer, max_prompt_len=config.training.max_prompt_len,
                                        max_gen_length=config.training.max_gen_length,
-                                       ignore_id=-100)
+                                       ignore_id=-100,
+                                       dllm_style_sft=bool(getattr(config.training, "dllm_style_sft", False)))
 
     model_base = getattr(config.model, "model_base", "sdar")
     if model_base == "sdar":
@@ -1112,16 +1113,33 @@ def main():
 
         # ── KL per token ────────────────────────────────────────
         _divergence_type = getattr(config.training, "loss_type", "kl")
+        # NaN-safe sum: at teacher_logp = -inf the KL contribution is 0 in
+        # the mathematical limit (p_t=0 means the term vanishes), but
+        # IEEE-754 gives 0 * -inf = NaN. Mask -inf entries to 0.
+        _t_finite_full = torch.isfinite(teacher_logprobs)
         if _divergence_type == "jsd":
             _jsd_alpha = getattr(config.training, "jsd_alpha", 0.5)
             teacher_probs = teacher_logprobs.exp()
             student_probs = student_logprobs.exp()
             M = _jsd_alpha * teacher_probs + (1.0 - _jsd_alpha) * student_probs
             log_M = M.log()
-            kl_div = _jsd_alpha * (teacher_probs * (teacher_logprobs - log_M)).sum(dim=-1) \
-                   + (1.0 - _jsd_alpha) * (student_probs * (student_logprobs - log_M)).sum(dim=-1)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_probs * (teacher_logprobs - log_M),
+                                     torch.zeros_like(teacher_logprobs))
+            _rev_terms = student_probs * (student_logprobs - log_M)
+            kl_div = _jsd_alpha * _fwd_terms.sum(dim=-1) \
+                   + (1.0 - _jsd_alpha) * _rev_terms.sum(dim=-1)
         else:
-            kl_div = (teacher_logprobs.exp() * (teacher_logprobs - student_logprobs)).sum(dim=-1)  # KL(teacher||student), (B, L-1)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_logprobs.exp() * (teacher_logprobs - student_logprobs),
+                                     torch.zeros_like(teacher_logprobs))
+            forward_kl = _fwd_terms.sum(dim=-1)  # KL(teacher||student), (B, L-1)
+            rkl_w = getattr(config.training, "reverse_kl_weight", 0.0)
+            if rkl_w > 0:
+                reverse_kl = (student_logprobs.exp() * (student_logprobs - teacher_logprobs)).sum(dim=-1)  # KL(student||teacher), (B, L-1)
+                kl_div = (1.0 - rkl_w) * forward_kl + rkl_w * reverse_kl
+            else:
+                kl_div = forward_kl
 
         # ── Loss mask: response tokens only ──────────────────────
         # shifted labels correspond to tokens at positions 1..L-1
@@ -1154,8 +1172,9 @@ def main():
             loss_by_masking_rate[metric_name] = (num_rate + 1, total_loss + loss_i.item())
 
         loss = loss_unreduced.mean()
-        # Count all non-padding tokens (prompt + response) for FLOPs estimation
-        num_forward_tokens = pad_mask.sum().item()
+        # Count meaningful response tokens (loss-mask region: response through
+        # first <|im_end|>, no eos-pad tail).
+        num_forward_tokens = loss_mask.sum().item()
         return loss, loss_by_masking_rate, num_forward_tokens
 
     def forward_process_ppo_causal(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
@@ -1330,17 +1349,33 @@ def main():
 
             
         _divergence_type = getattr(config.training, "loss_type", "kl")
+        # NaN-safe sum (see forward_process for full justification).
+        _t_finite_full = torch.isfinite(teacher_logprobs)
         if _divergence_type == "jsd":
             _jsd_alpha = getattr(config.training, "jsd_alpha", 0.5)
             teacher_probs = teacher_logprobs.exp()
             student_probs = log_probs.exp()
             M = _jsd_alpha * teacher_probs + (1.0 - _jsd_alpha) * student_probs
             log_M = M.log()
-            kl_div = _jsd_alpha * (teacher_probs * (teacher_logprobs - log_M)).sum(dim=-1) \
-                   + (1.0 - _jsd_alpha) * (student_probs * (log_probs - log_M)).sum(dim=-1)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_probs * (teacher_logprobs - log_M),
+                                     torch.zeros_like(teacher_logprobs))
+            _rev_terms = student_probs * (log_probs - log_M)
+            kl_div = _jsd_alpha * _fwd_terms.sum(dim=-1) \
+                   + (1.0 - _jsd_alpha) * _rev_terms.sum(dim=-1)
         else:
-            kl_div = (teacher_logprobs.exp() * (teacher_logprobs - log_probs)).sum(dim=-1)  # KL(teacher||student), (B, L0+L1)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_logprobs.exp() * (teacher_logprobs - log_probs),
+                                     torch.zeros_like(teacher_logprobs))
+            forward_kl = _fwd_terms.sum(dim=-1)  # KL(teacher||student), (B, L0+L1)
+            rkl_w = getattr(config.training, "reverse_kl_weight", 0.0)
+            if rkl_w > 0:
+                reverse_kl = (log_probs.exp() * (log_probs - teacher_logprobs)).sum(dim=-1)  # KL(student||teacher), (B, L0+L1)
+                kl_div = (1.0 - rkl_w) * forward_kl + rkl_w * reverse_kl
+            else:
+                kl_div = forward_kl
 
+        
         # prompt mask
         prompt = extended_input_ids[:, :L0]
         response_noised = extended_input_ids[:, L0 + L1 :]
@@ -1412,8 +1447,9 @@ def main():
             loss_by_masking_rate[metric_name] = (num_rate + 1, total_loss + loss_i.item())
         # print((loss_mask.float().mean().item(), kl_div[loss_mask].max().item(), loss.item()))
         loss = loss_unreduced.mean() # mean over batch dim
-        # Count all non-padding tokens in prompt+response (L0+L1) for FLOPs estimation
-        num_forward_tokens = prompt_response.ne(tokenizer.pad_token_id).sum().item()
+        # Count meaningful response tokens: through the natural <|im_end|>,
+        # excluding the eos-pad tail (matches the loss-mask cutoff above).
+        num_forward_tokens = response_mask.sum().item()
         return loss, loss_by_masking_rate, num_forward_tokens
 
     def forward_process_ppo(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
@@ -2002,7 +2038,8 @@ def init_training(config):
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
     uni_prompting = UniversalPrompting(tokenizer, max_prompt_len=config.training.max_prompt_len,
                                        max_gen_length=config.training.max_gen_length,
-                                       ignore_id=-100)
+                                       ignore_id=-100,
+                                       dllm_style_sft=bool(getattr(config.training, "dllm_style_sft", False)))
 
     model_base = getattr(config.model, "model_base", "sdar")
     if model_base == "sdar":
@@ -2164,15 +2201,23 @@ def init_training(config):
         cumulative_loss_tokens = 0
 
     # ── LR scheduler (created once, steps continuously across RL steps) ──
-    # Estimate inner optimizer steps per RL step from config:
-    #   num_training_rows ≈ num_task_per_step * rounds_per_prompt
-    #     rounds_per_prompt = block_size (default TraceRL) or 1 (one_state_per_block=True)
-    #   total_batch_size = batch_size_lm * num_processes * gradient_accumulation_steps
-    #   steps_per_rl_step = ceil(num_training_rows / total_batch_size) * num_train_epochs
-    _num_tasks = config.rollout.num_task_per_step
+    # Estimate inner optimizer steps per RL step from config. Rows-per-prompt
+    # depends on which branch in collect_training_data is taken:
+    #   - one_state_per_block=True (TraceRL with collapse): 1 row / prompt
+    #   - sft_alpha>=1.0 (pure SFT / off-policy SFT, teacher branch packs
+    #     all block rounds into one row): 1 row / prompt
+    #   - default TraceRL: up to block_size rows / prompt
+    # Chunk size also differs: pure-SFT mode draws num_task_per_step *
+    # num_response_per_task samples (rl.py:515) instead of num_task_per_step.
     _block_size = config.training.block_size
     _one_state_per_block = getattr(config.training, "one_state_per_block", False)
-    _rounds_per_prompt = 1 if _one_state_per_block else _block_size
+    _sft_alpha_for_lr = float(getattr(config.training, "sft_alpha", 0.0))
+    _is_pure_sft = (_sft_alpha_for_lr >= 1.0
+                    and config.dataset.get("sft_data", None) is not None)
+    _num_tasks = config.rollout.num_task_per_step
+    if _is_pure_sft:
+        _num_tasks = _num_tasks * config.rollout.get("num_response_per_task", 1)
+    _rounds_per_prompt = 1 if (_one_state_per_block or _is_pure_sft) else _block_size
     _est_rows = _num_tasks * _rounds_per_prompt
     _total_batch_size = config.training.batch_size_lm * accelerator.num_processes * config.training.gradient_accumulation_steps
     _num_inner_epochs = config.training.num_train_epochs
@@ -2625,24 +2670,106 @@ def train_one_step(state, config):
             replace_x0_indices = torch.arange(start=L0 + block_size - 1, end=L0 + L1, step=block_size)
             logits_teacher[:, replace_x0_indices] = logits_teacher_full[:, replace_x0_indices]
             logits_teacher = logits_teacher.roll(dims=1, shifts=1)
-            teacher_logprobs = F.log_softmax(logits_teacher.float(), dim=-1)
+            # Optional: re-normalize teacher distribution to match SFT-data sampling config
+            # (temperature, top_p, top_k, min_p). When set, the KL target becomes the
+            # actual sampling distribution that produced the SFT data, not raw teacher.
+            _t_T = float(getattr(config.training, "teacher_sampling_temperature", 1.0))
+            _t_topp = float(getattr(config.training, "teacher_sampling_top_p", 1.0))
+            _t_topk = int(getattr(config.training, "teacher_sampling_top_k", 0))
+            _t_minp = float(getattr(config.training, "teacher_sampling_min_p", 0.0))
+            _lt = logits_teacher.float()
+            if _t_T != 1.0:
+                _lt = _lt / _t_T
+            if _t_topk > 0 and _t_topk < _lt.size(-1):
+                _vals, _ = _lt.topk(_t_topk, dim=-1)
+                _min_kept = _vals[..., -1:].expand_as(_lt)
+                _lt = torch.where(_lt >= _min_kept, _lt, torch.full_like(_lt, float("-inf")))
+            if _t_topp < 1.0:
+                _sorted_lt, _sorted_idx = _lt.sort(dim=-1, descending=True)
+                _cum = _sorted_lt.softmax(dim=-1).cumsum(dim=-1)
+                _mask = _cum > _t_topp
+                _mask[..., 1:] = _mask[..., :-1].clone()
+                _mask[..., 0] = False
+                _sorted_lt = _sorted_lt.masked_fill(_mask, float("-inf"))
+                _inv = _sorted_idx.argsort(dim=-1)
+                _lt = _sorted_lt.gather(-1, _inv)
+            if _t_minp > 0.0:
+                _probs = _lt.softmax(dim=-1)
+                _thr = _probs.max(dim=-1, keepdim=True).values * _t_minp
+                _lt = _lt.masked_fill(_probs < _thr, float("-inf"))
+            teacher_logprobs = F.log_softmax(_lt, dim=-1)
 
         _divergence_type = getattr(config.training, "loss_type", "kl")
-        if _divergence_type == "jsd":
+        _top_k = int(getattr(config.training, "top_k_logits", 0))
+        if _top_k > 0:
+            # Nemotron-style sparse KL: restrict divergence to teacher's top-K tokens.
+            # See NVIDIA-NeMo/RL DistillationLossFn (typical K=64).
+            t_lp_k, idx_k = teacher_logprobs.topk(k=_top_k, dim=-1)   # (B, L, K)
+            s_lp_k = log_probs.gather(-1, idx_k)                       # (B, L, K)
+            # NaN-safe: at teacher_logprob == -inf the KL contribution is 0
+            # in the mathematical limit (p_t=0 means the term vanishes), but
+            # IEEE-754 gives 0 * -inf = NaN. Mask -inf entries to 0 explicitly.
+            # This matters when teacher_sampling_top_p further trims below
+            # top_k_logits=K → some of the K gathered indices have -inf logp.
+            _t_finite = torch.isfinite(t_lp_k)
+            if _divergence_type == "jsd":
+                _jsd_alpha = getattr(config.training, "jsd_alpha", 0.5)
+                t_p_k = t_lp_k.exp()
+                s_p_k = s_lp_k.exp()
+                M = _jsd_alpha * t_p_k + (1.0 - _jsd_alpha) * s_p_k
+                log_M = M.log()
+                _fwd_terms = torch.where(_t_finite, t_p_k * (t_lp_k - log_M), torch.zeros_like(t_lp_k))
+                _rev_terms = s_p_k * (s_lp_k - log_M)
+                kl_div = _jsd_alpha * _fwd_terms.sum(dim=-1) \
+                       + (1.0 - _jsd_alpha) * _rev_terms.sum(dim=-1)
+            else:
+                _fwd_terms = torch.where(_t_finite, t_lp_k.exp() * (t_lp_k - s_lp_k), torch.zeros_like(t_lp_k))
+                forward_kl = _fwd_terms.sum(dim=-1)
+                rkl_w = getattr(config.training, "reverse_kl_weight", 0.0)
+                if rkl_w > 0:
+                    # Reverse KL term: s_lp_k.exp() * (s_lp_k - t_lp_k). When
+                    # t_lp_k = -inf, this is +inf (assigning student mass to
+                    # forbidden teacher tokens is heavily penalized) — that's
+                    # the mode-seeking property of reverse KL, NOT NaN. Keep.
+                    reverse_kl = (s_lp_k.exp() * (s_lp_k - t_lp_k)).sum(dim=-1)
+                    kl_div = (1.0 - rkl_w) * forward_kl + rkl_w * reverse_kl
+                else:
+                    kl_div = forward_kl
+        elif _divergence_type == "jsd":
             _jsd_alpha = getattr(config.training, "jsd_alpha", 0.5)
             teacher_probs = teacher_logprobs.exp()
             student_probs = log_probs.exp()
             M = _jsd_alpha * teacher_probs + (1.0 - _jsd_alpha) * student_probs
             log_M = M.log()
-            kl_div = _jsd_alpha * (teacher_probs * (teacher_logprobs - log_M)).sum(dim=-1) \
-                   + (1.0 - _jsd_alpha) * (student_probs * (log_probs - log_M)).sum(dim=-1)
+            _t_finite_full = torch.isfinite(teacher_logprobs)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_probs * (teacher_logprobs - log_M),
+                                     torch.zeros_like(teacher_logprobs))
+            _rev_terms = student_probs * (log_probs - log_M)
+            kl_div = _jsd_alpha * _fwd_terms.sum(dim=-1) \
+                   + (1.0 - _jsd_alpha) * _rev_terms.sum(dim=-1)
         else:
-            kl_div = (teacher_logprobs.exp() * (teacher_logprobs - log_probs)).sum(dim=-1)
+            _t_finite_full = torch.isfinite(teacher_logprobs)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_logprobs.exp() * (teacher_logprobs - log_probs),
+                                     torch.zeros_like(teacher_logprobs))
+            forward_kl = _fwd_terms.sum(dim=-1)
+            rkl_w = getattr(config.training, "reverse_kl_weight", 0.0)
+            if rkl_w > 0:
+                reverse_kl = (log_probs.exp() * (log_probs - teacher_logprobs)).sum(dim=-1)
+                kl_div = (1.0 - rkl_w) * forward_kl + rkl_w * reverse_kl
+            else:
+                kl_div = forward_kl
 
         prompt = extended_input_ids[:, :L0]
         response_noised = extended_input_ids[:, L0 + L1:]
         prompt_mask = torch.cat([torch.zeros_like(prompt), torch.ones_like(response_noised)], dim=1).bool()
 
+        # Cut loss off after the FIRST <|im_end|> in the response. Under
+        # dllm-style the response ends with <|im_end|> then is eos-padded with
+        # more <|im_end|>; the cut keeps the natural end-of-response token in
+        # the loss (so the model learns to stop) while excluding the eos-pad
+        # tail (which would otherwise over-train it on <|im_end|>).
         im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
         is_im_end = prompt_response.eq(im_end_id)
         is_response_im_end = is_im_end & prompt_mask
@@ -2669,7 +2796,9 @@ def train_one_step(state, config):
             num_rate, total_loss = loss_by_masking_rate.get(metric_name, (0, 0))
             loss_by_masking_rate[metric_name] = (num_rate + 1, total_loss + loss_i.item())
         loss = loss_unreduced.mean()
-        num_forward_tokens = prompt_response.ne(tokenizer.pad_token_id).sum().item()
+        # Count meaningful response tokens: through the natural <|im_end|>,
+        # excluding the eos-pad tail (matches the loss-mask cutoff above).
+        num_forward_tokens = response_mask.sum().item()
         return loss, loss_by_masking_rate, num_forward_tokens
 
     def forward_process_causal(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
@@ -2688,16 +2817,58 @@ def train_one_step(state, config):
             teacher_logits = teacher_model(input_ids=input_ids, attention_mask=pad_mask_t).logits
             teacher_logprobs = F.log_softmax(teacher_logits[:, :-1, :].float(), dim=-1)
         _divergence_type = getattr(config.training, "loss_type", "kl")
-        if _divergence_type == "jsd":
+        _top_k = int(getattr(config.training, "top_k_logits", 0))
+        if _top_k > 0:
+            # Nemotron-style sparse KL: restrict divergence to teacher's top-K tokens.
+            t_lp_k, idx_k = teacher_logprobs.topk(k=_top_k, dim=-1)
+            s_lp_k = student_logprobs.gather(-1, idx_k)
+            # NaN-safe: at -inf teacher logp the KL contribution is 0 in the
+            # limit (see comment in forward_process). Mask -inf entries.
+            _t_finite = torch.isfinite(t_lp_k)
+            if _divergence_type == "jsd":
+                _jsd_alpha = getattr(config.training, "jsd_alpha", 0.5)
+                t_p_k = t_lp_k.exp()
+                s_p_k = s_lp_k.exp()
+                M = _jsd_alpha * t_p_k + (1.0 - _jsd_alpha) * s_p_k
+                log_M = M.log()
+                _fwd_terms = torch.where(_t_finite, t_p_k * (t_lp_k - log_M), torch.zeros_like(t_lp_k))
+                _rev_terms = s_p_k * (s_lp_k - log_M)
+                kl_div = _jsd_alpha * _fwd_terms.sum(dim=-1) \
+                       + (1.0 - _jsd_alpha) * _rev_terms.sum(dim=-1)
+            else:
+                _fwd_terms = torch.where(_t_finite, t_lp_k.exp() * (t_lp_k - s_lp_k), torch.zeros_like(t_lp_k))
+                forward_kl = _fwd_terms.sum(dim=-1)
+                rkl_w = getattr(config.training, "reverse_kl_weight", 0.0)
+                if rkl_w > 0:
+                    reverse_kl = (s_lp_k.exp() * (s_lp_k - t_lp_k)).sum(dim=-1)
+                    kl_div = (1.0 - rkl_w) * forward_kl + rkl_w * reverse_kl
+                else:
+                    kl_div = forward_kl
+        elif _divergence_type == "jsd":
             _jsd_alpha = getattr(config.training, "jsd_alpha", 0.5)
             teacher_probs = teacher_logprobs.exp()
             student_probs = student_logprobs.exp()
             M = _jsd_alpha * teacher_probs + (1.0 - _jsd_alpha) * student_probs
             log_M = M.log()
-            kl_div = _jsd_alpha * (teacher_probs * (teacher_logprobs - log_M)).sum(dim=-1) \
-                   + (1.0 - _jsd_alpha) * (student_probs * (student_logprobs - log_M)).sum(dim=-1)
+            _t_finite_full = torch.isfinite(teacher_logprobs)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_probs * (teacher_logprobs - log_M),
+                                     torch.zeros_like(teacher_logprobs))
+            _rev_terms = student_probs * (student_logprobs - log_M)
+            kl_div = _jsd_alpha * _fwd_terms.sum(dim=-1) \
+                   + (1.0 - _jsd_alpha) * _rev_terms.sum(dim=-1)
         else:
-            kl_div = (teacher_logprobs.exp() * (teacher_logprobs - student_logprobs)).sum(dim=-1)
+            _t_finite_full = torch.isfinite(teacher_logprobs)
+            _fwd_terms = torch.where(_t_finite_full,
+                                     teacher_logprobs.exp() * (teacher_logprobs - student_logprobs),
+                                     torch.zeros_like(teacher_logprobs))
+            forward_kl = _fwd_terms.sum(dim=-1)
+            rkl_w = getattr(config.training, "reverse_kl_weight", 0.0)
+            if rkl_w > 0:
+                reverse_kl = (student_logprobs.exp() * (student_logprobs - teacher_logprobs)).sum(dim=-1)
+                kl_div = (1.0 - rkl_w) * forward_kl + rkl_w * reverse_kl
+            else:
+                kl_div = forward_kl
         response_start = max(L0 - 1, 0)
         loss_mask = torch.zeros(B, _L - 1, dtype=torch.bool, device=device)
         loss_mask[:, response_start:] = True
@@ -2717,7 +2888,68 @@ def train_one_step(state, config):
             num_rate, total_loss = loss_by_masking_rate.get(metric_name, (0, 0))
             loss_by_masking_rate[metric_name] = (num_rate + 1, total_loss + loss_i.item())
         loss = loss_unreduced.mean()
-        num_forward_tokens = pad_mask_t.sum().item()
+        # Count meaningful response tokens (the loss-mask region — response
+        # area through first <|im_end|>, no eos-pad tail).
+        num_forward_tokens = loss_mask.sum().item()
+        return loss, loss_by_masking_rate, num_forward_tokens
+
+    def forward_process_nll(extended_input_ids, p_mask, tok_idx_ext, labels, adv, logp_old_tok):
+        # Pure SFT NLL on masked response positions. No teacher; ignores adv/logp_old_tok.
+        # Mirrors forward_process's block-attention forward and loss-mask conventions
+        # (im_end / pad handling) so wandb metrics remain comparable.
+        B, _L = p_mask.shape
+        device = extended_input_ids.device
+
+        attention_mask = basic_block_attention.clone()
+        attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
+        attention_mask = process_pad(attention_mask, extended_input_ids)
+
+        full_logits = model(input_ids=extended_input_ids, attention_mask=attention_mask, position_ids=tok_idx_ext).logits
+        logits = torch.cat([full_logits[:, :L0, :], full_logits[:, L0 + L1:, :]], dim=1)
+        if getattr(config.training, "student_arm_shift", False):
+            logits = logits.roll(dims=1, shifts=1)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        logp_tok = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+        prompt = extended_input_ids[:, :L0]
+        response_noised = extended_input_ids[:, L0 + L1:]
+        prompt_mask = torch.cat([torch.zeros_like(prompt), torch.ones_like(response_noised)], dim=1).bool()
+        prompt_response = extended_input_ids[:, :L0 + L1]
+        # Cut loss off after the FIRST <|im_end|> in the response. Under
+        # dllm-style SFT the response ends with <|im_end|> and is then eos-
+        # padded with more <|im_end|>; the cut supervises the natural end-of-
+        # response token (so the model learns to stop) while excluding the
+        # eos-pad tail (no over-training on repeated <|im_end|>).
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        is_im_end = prompt_response.eq(im_end_id)
+        is_response_im_end = is_im_end & prompt_mask
+        im_end_cumsum = is_response_im_end.cumsum(dim=1)
+        im_end_shifted = F.pad(im_end_cumsum[:, :-1], (1, 0))
+        im_end_mask = im_end_shifted.eq(0)
+        if getattr(config.training, "exclude_im_end", False):
+            im_end_mask = im_end_mask & ~is_response_im_end
+
+        prompt_noised_response = torch.cat([prompt, response_noised], dim=1)
+        pad_mask_t = prompt_noised_response.ne(tokenizer.pad_token_id)
+        masked_token_mask = prompt_noised_response.eq(tokenizer.mask_token_id)
+        response_mask = prompt_mask & pad_mask_t & im_end_mask
+        loss_mask = response_mask & masked_token_mask
+
+        nll_masked = (-logp_tok) * loss_mask
+        loss_unreduced = nll_masked.sum(dim=1) / loss_mask.sum(dim=1).clamp_min(1.0)
+
+        num_response_tokens = response_mask.sum(dim=1)
+        num_masked_tokens = loss_mask.sum(dim=1)
+        frac_masked = num_masked_tokens.float() / num_response_tokens.float().clamp(min=1)
+        loss_by_masking_rate = {}
+        for frac, loss_i in zip(frac_masked, loss_unreduced):
+            metric_name = f"train/loss_masked_frac_{frac:.1f}"
+            num_rate, total_loss = loss_by_masking_rate.get(metric_name, (0, 0))
+            loss_by_masking_rate[metric_name] = (num_rate + 1, total_loss + loss_i.item())
+        loss = loss_unreduced.mean()
+        # Count meaningful response tokens: through the natural <|im_end|>,
+        # excluding the eos-pad tail (matches the loss-mask cutoff above).
+        num_forward_tokens = response_mask.sum().item()
         return loss, loss_by_masking_rate, num_forward_tokens
 
     # ── Training loop ──
@@ -2762,6 +2994,8 @@ def train_one_step(state, config):
             _loss_type = getattr(config.training, "loss_type", "kl")
             if _loss_type in ("kl", "jsd"):
                 _fwd_fn = forward_process_causal if config.training.block_size == 1 else forward_process
+            elif _loss_type == "nll":
+                _fwd_fn = forward_process_nll
             else:
                 raise ValueError(f"Unknown loss_type: {_loss_type}")
 

@@ -8,7 +8,7 @@ Used by:
   - reward/rl_reward.py                     — checks correctness
 
 Dispatch:
-  1. Per-sample `data_i["domain"]` (opdlm_train case)
+  1. Per-sample `data_i["domain"]` (Hybrid_train case)
   2. Dataset-level `ds_cfg["domain"]` (DATASET_CONFIGS in eval_utils.py)
   3. Default "math"
 
@@ -290,65 +290,91 @@ def check_triviaqa(extracted, data_i):
 # ═══════════════════════════════════════════════════════════════════════
 # MC domain — single-letter multiple-choice extraction
 # ═══════════════════════════════════════════════════════════════════════
-def extract_mc(text, data_i=None):
-    """Extract single-letter MC answer.
+# Per-dataset allowed option letters. Restricting the letter set keeps the
+# fallback regexes from grabbing "I", "F", "E" out of "I think...",
+# "For example...", "Each option..." in thinking-mode responses.
+DATASET_LETTERS = {
+    "GPQA_Diamond_shuffled": "ABCD",
+    "GPQA_Main_shuffled": "ABCD",
+    "GPQA": "ABCD",
+    "ARC_C": "ABCDE",
+    "MMLU": "ABCD",
+    "MMLU_Redux": "ABCD",
+    "MMLU_Pro": "ABCDEFGHIJ",
+}
 
-    Strictly pattern-based — only accepts \\boxed{} and an explicit
-    "answer" cue. No bare-letter fallback (which produces lucky guesses
-    on rambling/truncated responses), no per-dataset letter restriction
-    (so it works across GPQA/ARC/MMLU/MMLU_Pro without configuration).
+
+def extract_mc(text, data_i=None, letters=None):
+    """Extract single-letter MC answer.
 
     Patterns tried, last-match wins within each:
       1. \\boxed{X} / \\boxed{\\text{X}} / \\boxed{\\textbf{X}}
       2. "Answer: X" / "Answer = X" / "**Answer:** 'X'"
       3. "answer is X" / "the correct answer is X" / "Final answer is X"
          / "answer is option X" / "answer is choice X"
+      4. Last standalone capital letter (bare-letter fallback).
 
-    Returns "[invalid]" when none of the patterns match — that's an
-    honest signal that the model never produced a parseable answer.
+    `letters`: restrict the accepted option letters (e.g. "ABCD" for GPQA).
+    Defaults to "ABCDEFGHIJ" (broadest A-J), which matches MMLU_Pro.
+
+    Returns "[invalid]" when no pattern matches.
     """
     text = (text or "").strip()
     if not text:
         return "[invalid]"
 
+    letters = (letters or "ABCDEFGHIJ").upper()
+    L = f"[{letters}{letters.lower()}]"
+
     # 1. \boxed{X} / \boxed{\text{X}} / \boxed{\textbf{X}}.
     boxed = re.findall(
-        r"\\boxed\{\s*(?:\\text(?:bf|rm|sf|tt|it)?\s*\{)?\s*([A-Za-z])",
+        rf"\\boxed\{{\s*(?:\\text(?:bf|rm|sf|tt|it)?\s*\{{)?\s*({L})",
         text,
     )
     if boxed:
         return boxed[-1].upper()
 
     # 2. "Answer: X" / "**Answer:** 'X'" / `"answer": "X"` (JSON-like).
-    #    Allow quotes between "answer" and the colon (JSON-encoded form).
     matches = re.findall(
-        r"(?i)\banswer\b[\s\*\"'\)\]]*[:=][\s\*\"'\$\(]*([A-Za-z])",
+        rf"(?i)\banswer\b[\s\*\"'\)\]]*[:=][\s\*\"'\$\(]*({L})",
         text,
     )
     if matches:
         return matches[-1].upper()
 
     # 3. "answer is X" / "the correct answer is X" / "answer is option X" /
-    #    "the correct answer is:\n\n**X**" (model emits a stop-list before X).
-    #    Colon and period are allowed between "is" and the letter.
+    #    "the correct answer is:\n\n**X**".
     matches = re.findall(
-        r"(?i)\banswer\b[\s\*\"']*\bis\b[\s\*\"'\$\(\:\.]*"
-        r"(?:option|choice|letter)?[\s\*\"'\$\(\:\.]*"
-        r"([A-Za-z])\b",
+        rf"(?i)\banswer\b[\s\*\"']*\bis\b[\s\*\"'\$\(\:\.]*"
+        rf"(?:option|choice|letter)?[\s\*\"'\$\(\:\.]*"
+        rf"({L})\b",
         text,
     )
     if matches:
         return matches[-1].upper()
 
-    # 4. Fallback: last standalone capital letter A-Z. Catches prose
-    #    conclusions like "So C is correct." that don't use any of
-    #    the explicit cues above. Last-match (not first) avoids
-    #    grabbing option-list letters from the analysis section.
-    bare = re.findall(r"\b([A-Z])\b", text)
+    # 4. Fallback: last standalone capital letter from the allowed set.
+    bare = re.findall(rf"\b([{letters}])\b", text)
     if bare:
         return bare[-1].upper()
 
     return "[invalid]"
+
+
+def _letters_for_dataset(ds_cfg):
+    """Resolve allowed option letters for an MC dataset.
+
+    Looks up `ds_cfg["letters"]` if set (per-dataset override), else uses
+    `ds_cfg["path"]` basename against DATASET_LETTERS, else returns None
+    (caller falls back to A-J).
+    """
+    if not ds_cfg:
+        return None
+    if ds_cfg.get("letters"):
+        return ds_cfg["letters"]
+    path = ds_cfg.get("path") or ""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return DATASET_LETTERS.get(stem)
 
 
 def check_mc(extracted, data_i):
@@ -361,7 +387,7 @@ def check_mc(extracted, data_i):
 # ═══════════════════════════════════════════════════════════════════════
 # CODE domain — python code extraction + multi-format test runner
 # ═══════════════════════════════════════════════════════════════════════
-# opdlm_train ships code samples in 4 different test formats. We dispatch
+# Hybrid_train ships code samples in 4 different test formats. We dispatch
 # on the shape of `data_i["tests_json"]`:
 #
 #   pytest       : {"type":"pytest","test_code":"...","fn_name":"..."}
@@ -574,11 +600,11 @@ def check_code(extracted, data_i):
 # ═══════════════════════════════════════════════════════════════════════
 # Dispatch
 # ═══════════════════════════════════════════════════════════════════════
-# opdlm_train uses per-sample `domain` labels that don't always match our
+# Hybrid_train uses per-sample `domain` labels that don't always match our
 # canonical names. Map dataset-native labels onto canonical domains.
 DOMAIN_ALIASES = {
     "math":    "math",
-    "science": "mc",     # opdlm_train science samples are `\boxed{letter}` MC.
+    "science": "mc",     # Hybrid_train science samples are `\boxed{letter}` MC.
     "mc":      "mc",
     "code":    "code",
     # "chat" intentionally omitted — chat has no verifiable answer; see
@@ -1206,7 +1232,7 @@ def get_domain(data_i=None, ds_cfg=None, default="math"):
     """Resolve the canonical domain for a sample.
 
     Precedence:
-      1. Per-sample `data_i["domain"]` (e.g. opdlm_train has per-sample mix)
+      1. Per-sample `data_i["domain"]` (e.g. Hybrid_train has per-sample mix)
       2. Dataset-level `ds_cfg["domain"]`
       3. `default` (usually "math")
 
@@ -1240,6 +1266,8 @@ def extract_answer(text, data_i=None, ds_cfg=None, default_domain="math",
             return extract_math_oc(text, data_i)
         if domain == "mc":
             return extract_mc_oc(text, data_i)
+    if domain == "mc":
+        return extract_mc(text, data_i, letters=_letters_for_dataset(ds_cfg))
     fn = EXTRACTORS.get(domain, extract_math)
     return fn(text, data_i)
 
