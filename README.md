@@ -185,7 +185,7 @@ shard the generation across GPUs.
 | T3 — Multilingual              | Eval         | `run_eval_greedy_{4B,8B}_base.sh` on MMMLU-lite / INCLUDE-lite / MT-AIME2024 / MLogiQA |
 | T5 — OPDLM-MATH vs TraDo       | Train + eval | `post_train_math/BD3LM_MATH_{4B,8B}.sh` (non-thinking) and `BD3LM_MATH_{4B,8B}_thinking.sh` (thinking-on) |
 | T6 — Smaller scales (0.6B/1.7B) | Train + eval | `general_pre_train/BD3LM_{06B,17B}.sh` → `run_eval_greedy_{06B,17B}_base.sh` |
-| Figures 3-7 — decoding sweeps   | Eval        | `run_eval_greedy_4B_base_{dynamic,fix_thres}.sh` |
+| Figures 3-5 — decoding sweeps   | Eval        | `run_eval_greedy_4B_base_{dynamic,fix_thres}.sh` |
 
 ---
 
