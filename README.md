@@ -206,7 +206,7 @@ shard the generation across GPUs.
 If you use this code or the OPDLM models, please cite the preprint:
 
 ```bibtex
-@misc{su2026dataefficientautoregressivetodiffusionlanguagemodels,
+@misc{su2026opdlm,
       title={Data-Efficient Autoregressive-to-Diffusion Language Models via On-Policy Distillation},
       author={Xingyu Su and Jacob Helwig and Shubham Parashar and Atharv Chagi and Lakshmi Jotsna and Degui Zhi and James Caverlee and Dileep Kalathil and Shuiwang Ji},
       year={2026},
