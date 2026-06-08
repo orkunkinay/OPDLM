@@ -4,7 +4,7 @@
 
 ### Data-Efficient Autoregressive-to-Diffusion Language Models via On-Policy Distillation
 
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.06712-b31b1b.svg)](https://arxiv.org/abs/2606.06712)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Collection-yellow)](https://huggingface.co/collections/divelab/opdlm)
 [![Project Page](https://img.shields.io/badge/Project%20Page-OPDLM-blue)](https://opdlm.vercel.app/)
 
