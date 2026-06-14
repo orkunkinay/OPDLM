@@ -5,6 +5,7 @@ import json
 import math
 import shutil
 import random
+import signal
 import time
 from datetime import datetime
 from termcolor import cprint
@@ -22,6 +23,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rew
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sample'))
 
 from eval_utils import DATASET_CONFIGS as _EVAL_DATASET_CONFIGS
+from cluster.cluster_utils import (
+    resolve_auto_resume,
+    log_cuda_memory,
+    write_run_metadata,
+    validate_gpu_requested,
+)
 
 
 def _eval_dataset_is_code(ds_name):
@@ -54,7 +61,38 @@ if __name__ == "__main__":
     # Fallback to per-rank now() only if the env var isn't set — this can produce
     # divergent project dirs if ranks initialize >1 second apart (seen on dive9).
     timestamp = os.environ.get("RUN_TIMESTAMP") or datetime.now().strftime("%m%d_%H%M%S")
-    if not start_from_scratch and config.experiment.get("project", None):
+
+    # ── Auto-resume (Slurm-friendly) ──
+    # When experiment.auto_resume is set, the run is pinned to a *stable*
+    # directory (RUN_DIR env or experiment.project) instead of a fresh
+    # timestamped one, so a re-submitted/preempted job continues the same run.
+    # If that dir already holds a valid checkpoint we resume from it; otherwise
+    # we start fresh but keep the stable dir so the next submit can resume.
+    auto_resume = bool(config.experiment.get("auto_resume", False))
+    _auto_resumed = False
+    if auto_resume:
+        stable_dir = os.environ.get("RUN_DIR") or config.experiment.project
+        should_resume, last_step = resolve_auto_resume(stable_dir, config.model.optimized_name)
+        project_name = stable_dir
+        run_name = os.path.basename(stable_dir.rstrip("/"))
+        if should_resume:
+            start_from_scratch = False
+            config.experiment.start_from_scratch = False
+            config.experiment.current_epoch = last_step + 1
+            if is_main:
+                print(f"[auto-resume] found checkpoint at {stable_dir} (last step {last_step}); "
+                      f"continuing at step {last_step + 1}")
+        else:
+            start_from_scratch = True
+            config.experiment.start_from_scratch = True
+            if is_main:
+                print(f"[auto-resume] no usable checkpoint under {stable_dir}; starting fresh "
+                      f"(future re-submits will resume this dir)")
+        _auto_resumed = True
+
+    if _auto_resumed:
+        pass  # project_name / run_name already resolved above
+    elif not start_from_scratch and config.experiment.get("project", None):
         # Resume: use existing experiment directory
         project_name = config.experiment.project
         run_name = os.path.basename(project_name)
@@ -63,6 +101,29 @@ if __name__ == "__main__":
         _exp_base = os.environ.get("EXP_BASE", "experiments")
         project_name = f"{_exp_base}/{run_name}"           # unique output dir per run
     print(f"Config: {config_name} | Project dir: {project_name}")
+
+    # ── Graceful preemption / time-limit handling ──
+    # SIGTERM (scancel / OOM-killer warning) and SIGUSR1 (Slurm --signal=USR1@N)
+    # set a flag; the main loop checkpoints and exits cleanly at the next
+    # RL-step boundary. We never interrupt a step mid-way, so the saved state is
+    # always consistent.
+    _stop_requested = {"flag": False, "sig": None}
+
+    def _signal_handler(signum, frame):
+        _stop_requested["flag"] = True
+        _stop_requested["sig"] = signum
+        try:
+            name = signal.Signals(signum).name
+        except Exception:
+            name = str(signum)
+        print(f"[signal] received {name}; will checkpoint and exit at the next safe point.",
+              flush=True)
+
+    for _sig in (signal.SIGTERM, signal.SIGUSR1):
+        try:
+            signal.signal(_sig, _signal_handler)
+        except Exception as _e:
+            print(f"[signal] could not install handler for {_sig}: {_e!r}")
     wandb_group = config.wandb.get("group", None)
     model_base = config.model.model_base
 
@@ -91,6 +152,25 @@ if __name__ == "__main__":
     if _global_seed is not None:
         os.environ["TRACERL_SEED"] = str(_global_seed)
         os.environ["PYTHONHASHSEED"] = str(_global_seed)
+
+    # ── Failure tolerance: fail early with an actionable message ──
+    # GPU training is always required here (DeepSpeed + JetEngine rollout).
+    validate_gpu_requested(require_cuda=True)
+
+    # ── Reproducibility: snapshot run metadata + resolved config ──
+    if is_main:
+        os.makedirs(project_name, exist_ok=True)
+        try:
+            write_run_metadata(
+                project_name,
+                resolved_config=OmegaConf.to_container(config, resolve=True),
+                config_path=(_config_arg.split("=", 1)[1] if _config_arg else None),
+                seed=_global_seed,
+                repo_dir=os.path.dirname(os.path.abspath(__file__)),
+            )
+        except Exception as _e:
+            print(f"[metadata] could not write run_metadata.json: {_e!r}")
+        log_cuda_memory("startup", reset_peak=True)
 
     from omegaconf import MISSING
     have_value_model = (OmegaConf.select(config, "model.value_base_model", default=MISSING) is not MISSING)
@@ -137,6 +217,7 @@ if __name__ == "__main__":
     training_state = init_training(config)
     if is_main:
         cprint("Training engine initialized.", "green")
+        log_cuda_memory("after training engine init")
 
     # 2. Initialize JetEngine (rollout) on each rank
     #    torch.distributed is now initialized by the Accelerator, so JetEngine
@@ -153,6 +234,7 @@ if __name__ == "__main__":
     je_llm, je_tokenizer = init_jetengine(pretrained_model, config)
     if is_main:
         cprint("JetEngine initialized.", "green")
+        log_cuda_memory("after JetEngine init")
 
     # 3. Import reward function
     from rl_reward import compute_rewards
@@ -181,6 +263,30 @@ if __name__ == "__main__":
         # total_step already set in early block above; just reuse for logging
         if is_main:
             print(f"Epoch mode: {len(_train_data_pool)} samples, {_chunk_size}/step, {_total_steps_per_epoch} steps/epoch, {_num_train_epochs} epochs, {config.experiment.total_step} total RL steps")
+        # On resume, restore the data-iterator position so we don't replay the
+        # same prompts. The reshuffle order is not restored (only the index +
+        # epoch counter), so forward progress and step counting are preserved.
+        if not start_from_scratch:
+            _iter_state_path = os.path.join(project_name, "temp_data", "data_iter_state.json")
+            if os.path.exists(_iter_state_path):
+                try:
+                    with open(_iter_state_path) as f:
+                        _st = json.load(f)
+                    _train_data_idx[0] = int(_st.get("idx", 0)) % max(len(_train_data_pool), 1)
+                    _train_epoch[0] = int(_st.get("epoch", 1))
+                    if is_main:
+                        print(f"[auto-resume] data iterator restored: idx={_train_data_idx[0]}, epoch={_train_epoch[0]}")
+                except Exception as _e:
+                    if is_main:
+                        print(f"[auto-resume] could not restore data iterator state: {_e!r}")
+
+    def _save_data_iter_state():
+        if not (_epoch_mode and is_main):
+            return
+        _iter_state_path = os.path.join(project_name, "temp_data", "data_iter_state.json")
+        os.makedirs(os.path.dirname(_iter_state_path), exist_ok=True)
+        with open(_iter_state_path, "w") as f:
+            json.dump({"idx": _train_data_idx[0], "epoch": _train_epoch[0]}, f)
 
     def _next_train_chunk():
         """Get next sequential chunk. Reshuffle when epoch exhausted."""
@@ -269,6 +375,10 @@ if __name__ == "__main__":
         else:
             raise ValueError(f"Unknown dynamic_threshold_schedule type: {_dt_type}")
         return float(_dt_start + (_dt_end - _dt_start) * frac)
+
+    # CUDA memory observability (opt-in via config; default off => 0).
+    _log_memory_every = int(config.experiment.get("log_memory_every", 0) or 0)
+    _reset_mem_peak = bool(config.experiment.get("reset_memory_peak_each_log", False))
 
     # GPU hours tracking
     _cuda_devs = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -405,11 +515,17 @@ if __name__ == "__main__":
 
         do_train(train_i, max_gen_length=_scheduled_max_token)
 
+        # Persist the data-iterator position so an interrupted job resumes at
+        # the right place (epoch mode only; no-op otherwise).
+        _save_data_iter_state()
+
         if is_main:
             _step_hours = (time.time() - _step_start) / 3600.0
             _total = _read_gpu_hours() + _num_gpus * _step_hours
             _write_gpu_hours(_total)
             print(f"Finished training for step {train_i}. Step GPU hours: {_num_gpus * _step_hours:.2f}, Cumulative: {_total:.2f}")
+            if _log_memory_every > 0 and (train_i % _log_memory_every == 0):
+                log_cuda_memory(f"step {train_i}", reset_peak=_reset_mem_peak)
 
     # ── Eval loop ──
     def eval_loop(eval_i):
@@ -515,8 +631,41 @@ if __name__ == "__main__":
         _epoch_pbar = tqdm(total=_total_steps_per_epoch, desc=f"Data epoch {_train_epoch[0]}/{_num_train_epochs}", dynamic_ncols=True)
     _prev_epoch = _train_epoch[0]
 
+    def _stop_now():
+        """Return True if a shutdown signal was received on *any* rank.
+
+        The emergency checkpoint is a DeepSpeed collective, so all ranks must
+        agree to enter it together. Slurm may deliver the signal to only some
+        ranks, so we all-reduce the flag at the (synchronized) step boundary."""
+        flag = 1 if _stop_requested["flag"] else 0
+        if dist.is_available() and dist.is_initialized():
+            t = torch.tensor([flag], device=torch.device("cuda", local_rank))
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            flag = int(t.item())
+        return flag > 0
+
+    def _checkpoint_and_exit(step_i):
+        """Graceful shutdown on SIGTERM/SIGUSR1: force a consistent full-state
+        checkpoint for the just-completed step, then exit so Slurm can requeue.
+        train_one_step already saved this step's weights; this additionally
+        persists the DeepSpeed optimizer + LR scheduler even if the step was not
+        on the save_every cadence."""
+        if is_main:
+            cprint(f"[signal] checkpointing full training state at step {step_i} and exiting...", "yellow")
+        config.experiment.current_epoch = step_i
+        from rl_sdar import force_full_checkpoint
+        force_full_checkpoint(training_state, config)
+        log_cuda_memory("before exit")
+        dist.barrier()
+        if _epoch_pbar is not None:
+            _epoch_pbar.close()
+        sys.exit(0)
+
     while not _should_stop(i):
         train_loop(i)
+
+        if _stop_now():
+            _checkpoint_and_exit(i)
 
         if _epoch_pbar is not None:
             _epoch_pbar.update(1)
@@ -533,7 +682,12 @@ if __name__ == "__main__":
             #         _best_eval_acc = eval_acc
             #         _save_best_checkpoint(i, eval_acc)
 
+        if _stop_now():
+            _checkpoint_and_exit(i)
+
         i += 1
 
     if _epoch_pbar is not None:
         _epoch_pbar.close()
+
+    log_cuda_memory("before exit")

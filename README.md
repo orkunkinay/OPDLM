@@ -139,6 +139,20 @@ submitting.
 The relevant accelerate configs (single-node, 1/2/4/8 GPU, ZeRO-3) live in
 `accelerate_configs/`.
 
+### Running on a Slurm cluster (resumable / preemption-tolerant)
+
+For Slurm runs that must survive interruptions and resume automatically, use
+the ready-made launchers in `cluster/` and see **[CLUSTER_RUN.md](CLUSTER_RUN.md)**:
+
+```bash
+sbatch cluster/smoke_test.sh   # tiny 2-step end-to-end check
+sbatch cluster/train.sh        # real run; re-submit to auto-resume
+```
+
+These wire up `experiment.auto_resume=true` (resume from the latest valid
+checkpoint), SIGTERM/SIGUSR1 emergency checkpointing, a `run_metadata.json`
+snapshot, and optional CUDA-memory logging.
+
 ---
 
 ## 5. Evaluation

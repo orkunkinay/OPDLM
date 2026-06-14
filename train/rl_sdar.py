@@ -1804,6 +1804,24 @@ def save_checkpoint(model, tokenizer, config, accelerator, name, save_training_s
 
         logger.info(f"Saved model + tokenizer to {save_dir}")
 
+def force_full_checkpoint(state, config):
+    """Emergency, full-state checkpoint (model + DeepSpeed optimizer + LR
+    scheduler) for graceful preemption / time-limit handling.
+
+    Safe to call only at an RL-step boundary (i.e. not in the middle of an
+    optimizer.step()). ``rl.py`` calls this from its signal-driven shutdown path
+    after the current step's ``train_one_step`` has finished, so the saved state
+    is always consistent. Reuses the same atomic ``save_checkpoint`` path used by
+    normal training.
+    """
+    save_checkpoint(
+        state["model"], state["tokenizer"], config, state["accelerator"],
+        config.model.optimized_name,
+        save_training_state_flag=True,
+        lr_scheduler=state.get("lr_scheduler"),
+    )
+
+
 def get_training_state_dir(config, name):
     return Path(config.experiment.project) / "training_state" / name
 
