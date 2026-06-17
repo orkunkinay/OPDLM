@@ -7,16 +7,18 @@
 #   conda activate opdlm
 #   pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
 #   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+#   # Optional, only when running with model.attn_backend=flash:
 #   pip install flash-attn==2.7.4.post1 --no-build-isolation
 #
 # (flash-attn must be installed AFTER torch with --no-build-isolation; otherwise
 # it tries to install its own torch and the build pulls a wheel that mismatches
-# the env.)
+# the env. If your cluster cannot build flash-attn, use model.attn_backend=sdpa.)
 
 # ── Core ML ──
 torch==2.6.0+cu124
 triton==3.2.0
-flash-attn==2.7.4.post1
+# Optional: install manually after torch if using model.attn_backend=flash.
+# flash-attn==2.7.4.post1
 numpy==1.26.4              # vllm 0.8.x in turn pulls numba which caps numpy<2; pinning to 1.26 keeps everyone happy
 scipy==1.15.3
 einops==0.8.2

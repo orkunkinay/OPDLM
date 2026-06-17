@@ -28,6 +28,7 @@ from accelerate.utils import DistributedType, set_seed
 
 
 from models import SDARForCausalLM
+from attention_backend import get_model_attn_kwargs
 from train.prompting_utils import UniversalPrompting
 from models.lr_schedulers import get_scheduler
 from models.logging import set_verbosity_info, set_verbosity_error
@@ -296,6 +297,7 @@ def main():
 
 
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
+    attn_kwargs = get_model_attn_kwargs(config)
     uni_prompting = UniversalPrompting(tokenizer, max_prompt_len=config.training.max_prompt_len,
                                        max_gen_length=config.training.max_gen_length,
                                        ignore_id=-100,
@@ -303,7 +305,7 @@ def main():
 
     model_base = getattr(config.model, "model_base", "sdar")
     if model_base == "sdar":
-        model = SDARForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto")
+        model = SDARForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto", **attn_kwargs)
     elif model_base == "bd3lm":
         # ── Inline A2DQwen3 registration (transformers 4.52 compat) ──
         import transformers as _tf
@@ -369,9 +371,9 @@ def main():
         _tf.AutoModelForMaskedLM.register(_A2DQwen3Config, _A2DQwen3LMHeadModel)
 
         from transformers import AutoModelForMaskedLM
-        model = AutoModelForMaskedLM.from_pretrained(pretrained_model, trust_remote_code=False, torch_dtype="auto")
+        model = AutoModelForMaskedLM.from_pretrained(pretrained_model, trust_remote_code=False, torch_dtype="auto", **attn_kwargs)
     else:
-        model = AutoModelForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto")
+        model = AutoModelForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto", **attn_kwargs)
 
     # calculate loss ourselves, needs logits，so aviod fuse CE
     if hasattr(model, "config"):
@@ -950,7 +952,7 @@ def main():
         accelerator.state.select_deepspeed_plugin("teacher")
         accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 1
         teacher_model = AutoModelForCausalLM.from_pretrained(
-            config.model.teacher_model, trust_remote_code=True, torch_dtype="auto"
+            config.model.teacher_model, trust_remote_code=True, torch_dtype="auto", **attn_kwargs
         )
         teacher_model.requires_grad_(False)
         teacher_model = accelerator.prepare(teacher_model)
@@ -2054,6 +2056,7 @@ def init_training(config):
     logger.info("Loading models and optimizer")
 
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
+    attn_kwargs = get_model_attn_kwargs(config)
     uni_prompting = UniversalPrompting(tokenizer, max_prompt_len=config.training.max_prompt_len,
                                        max_gen_length=config.training.max_gen_length,
                                        ignore_id=-100,
@@ -2061,7 +2064,7 @@ def init_training(config):
 
     model_base = getattr(config.model, "model_base", "sdar")
     if model_base == "sdar":
-        model = SDARForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto")
+        model = SDARForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto", **attn_kwargs)
     elif model_base == "bd3lm":
         import transformers as _tf
         from transformers.cache_utils import DynamicCache
@@ -2125,9 +2128,9 @@ def init_training(config):
         _tf.AutoModelForMaskedLM.register(_A2DQwen3Config, _A2DQwen3LMHeadModel)
 
         from transformers import AutoModelForMaskedLM
-        model = AutoModelForMaskedLM.from_pretrained(pretrained_model, trust_remote_code=False, torch_dtype="auto")
+        model = AutoModelForMaskedLM.from_pretrained(pretrained_model, trust_remote_code=False, torch_dtype="auto", **attn_kwargs)
     else:
-        model = AutoModelForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto")
+        model = AutoModelForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto", **attn_kwargs)
 
     if hasattr(model, "config"):
         model.config.fuse_cross_entropy = False
@@ -2196,7 +2199,7 @@ def init_training(config):
         accelerator.state.select_deepspeed_plugin("teacher")
         accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 1
         teacher_model = AutoModelForCausalLM.from_pretrained(
-            config.model.teacher_model, trust_remote_code=True, torch_dtype="auto"
+            config.model.teacher_model, trust_remote_code=True, torch_dtype="auto", **attn_kwargs
         )
         teacher_model.requires_grad_(False)
         teacher_model = accelerator.prepare(teacher_model)
