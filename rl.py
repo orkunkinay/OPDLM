@@ -29,6 +29,7 @@ from cluster.cluster_utils import (
     write_run_metadata,
     validate_gpu_requested,
 )
+from attention_backend import get_model_attn_implementation
 
 
 def _eval_dataset_is_code(ds_name):
@@ -219,10 +220,13 @@ if __name__ == "__main__":
         cprint("Training engine initialized.", "green")
         log_cuda_memory("after training engine init")
 
-    # 2. Initialize JetEngine (rollout) on each rank
+    attn_implementation = get_model_attn_implementation(config)
+
+    # 2. Initialize rollout engine on each rank
     #    torch.distributed is now initialized by the Accelerator, so JetEngine
     #    will detect it and set _owns_process_group=False (colocate mode).
-    if is_main:
+    use_jetengine = attn_implementation == "flash_attention_2"
+    if is_main and use_jetengine:
         cprint("Initializing JetEngine rollout engine...", "green")
     # On resume, load JetEngine from the saved checkpoint (matches the training student).
     if config.experiment.current_epoch > 1 or not start_from_scratch:
@@ -230,9 +234,16 @@ if __name__ == "__main__":
         pretrained_model = _ckpt_path if os.path.exists(_ckpt_path) else config.model.pretrained_model
     else:
         pretrained_model = config.model.pretrained_model
-    from bd3lm_rl_rollout import init_jetengine
-    je_llm, je_tokenizer = init_jetengine(pretrained_model, config)
-    if is_main:
+    if use_jetengine:
+        from bd3lm_rl_rollout import init_jetengine
+        je_llm, je_tokenizer = init_jetengine(pretrained_model, config)
+    else:
+        from transformers import AutoTokenizer
+        if is_main:
+            cprint(f"Using Hugging Face rollout engine with attn_implementation={attn_implementation}.", "green")
+        je_llm = None
+        je_tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
+    if is_main and use_jetengine:
         cprint("JetEngine initialized.", "green")
         log_cuda_memory("after JetEngine init")
 
@@ -468,7 +479,8 @@ if __name__ == "__main__":
     def do_train(i, max_gen_length=None):
         """Train one step using persistent training state."""
         # Free all JetEngine GPU memory (params + KV cache + graphs) for training
-        sleep_jetengine(je_llm)
+        if je_llm is not None:
+            sleep_jetengine(je_llm)
 
         cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
         cfg.experiment.current_epoch = i
@@ -484,7 +496,8 @@ if __name__ == "__main__":
 
         # Reload JetEngine weights from the new checkpoint
         checkpoint_path = os.path.join(project_name, "ckpt", config.model.optimized_name)
-        reload_jetengine_weights(je_llm, checkpoint_path)
+        if je_llm is not None:
+            reload_jetengine_weights(je_llm, checkpoint_path)
 
     # ── Train loop ──
     def train_loop(train_i):

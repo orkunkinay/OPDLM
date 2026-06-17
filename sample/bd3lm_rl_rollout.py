@@ -50,6 +50,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'reward'))
 from eval_utils import DATASET_CONFIGS, reformat_choices, build_evalplus_prompt, build_lcb_prompt
+from attention_backend import get_model_attn_kwargs, get_model_attn_implementation
 
 # Domain-based extraction dispatch (math / mc / code).
 # Per-sample `data_i["domain"]` > ds_cfg["domain"] > default "math".
@@ -503,8 +504,10 @@ def _gpu_worker(rank, model_path, prompt_ids_chunk, sample_kwargs, result_dict):
     _register_a2d_model_classes()
     torch.cuda.set_device(rank)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    attn_config = sample_kwargs.pop("config", None)
+    attn_kwargs = get_model_attn_kwargs(attn_config) if attn_config is not None else {}
     model = AutoModelForMaskedLM.from_pretrained(
-        model_path, trust_remote_code=False, torch_dtype=torch.bfloat16,
+        model_path, trust_remote_code=False, torch_dtype=torch.bfloat16, **attn_kwargs,
     ).to(f"cuda:{rank}").eval()
 
     batch_size = sample_kwargs.pop("batch_size", 8)
@@ -891,24 +894,76 @@ def run_rollout(llm, tokenizer, config, project_name, rank, world_size, data_ove
     my_prompts = [generation_prompts[i] for i in my_indices]
 
     max_active_local = int(config.rollout.get("max_active", 256))
-    if per_dom_max_cap:
+    if llm is None:
+        _register_a2d_model_classes()
+        attn_impl = get_model_attn_implementation(config)
+        if rank == 0:
+            cprint(f"  Using Hugging Face rollout with attn_implementation={attn_impl}", "green")
+        model = AutoModelForMaskedLM.from_pretrained(
+            pretrained_model,
+            trust_remote_code=False,
+            torch_dtype=torch.bfloat16,
+            **get_model_attn_kwargs(config),
+        ).to(torch.device("cuda", torch.cuda.current_device())).eval()
+
+        batch_size = int(config.rollout.get("pytorch_batch_size", 8))
+        my_results = []
+
+        def _run_prompt_batch(batch_prompts, batch_indices, batch_max_new_tokens):
+            prompt_ids = [
+                torch.tensor(tokenizer.encode(p, add_special_tokens=False), dtype=torch.long)
+                for p in batch_prompts
+            ]
+            output_ids, padded_prompt_len = bd3lm_sample(
+                model,
+                tokenizer,
+                prompt_ids,
+                max_new_tokens=batch_max_new_tokens,
+                block_size=block_size_cfg,
+                steps=denoising_steps,
+                temperature=temperature_cfg,
+                remasking=remasking_cfg,
+            )
+            texts = _decode_batch(output_ids, padded_prompt_len, [len(ids) for ids in prompt_ids], tokenizer)
+            for gi, text in zip(batch_indices, texts):
+                tok_len = len(tokenizer.encode(text, add_special_tokens=False))
+                my_results.append((gi, text, [], tok_len))
+
+        if per_dom_max_cap:
+            for gi, prompt in zip(my_indices, my_prompts):
+                _run_prompt_batch([prompt], [gi], _max_tokens_for(index_list[gi]))
+        else:
+            for start in range(0, len(my_prompts), batch_size):
+                end = min(start + batch_size, len(my_prompts))
+                _run_prompt_batch(my_prompts[start:end], my_indices[start:end], max_new_tokens)
+
+        del model
+        torch.cuda.empty_cache()
+    elif per_dom_max_cap:
         sp_list = []
         for gi in my_indices:
             mt = _max_tokens_for(index_list[gi])
             sp_list.append(SamplingParams(**{**sampling_kwargs, "max_tokens": mt}))
         outputs = llm.generate_streaming(my_prompts, sp_list, max_active=max_active_local)
+        my_results = []
+        for j, o in enumerate(outputs):
+            my_results.append((
+                my_indices[j],
+                o["text"],
+                o.get("first_unmask_times", None),
+                len(o["token_ids"]),
+            ))
     else:
         sp = SamplingParams(**sampling_kwargs)
         outputs = llm.generate_streaming(my_prompts, sp, max_active=max_active_local)
-
-    my_results = []
-    for j, o in enumerate(outputs):
-        my_results.append((
-            my_indices[j],
-            o["text"],
-            o.get("first_unmask_times", None),
-            len(o["token_ids"]),
-        ))
+        my_results = []
+        for j, o in enumerate(outputs):
+            my_results.append((
+                my_indices[j],
+                o["text"],
+                o.get("first_unmask_times", None),
+                len(o["token_ids"]),
+            ))
 
     if rank == 0:
         cprint(f"  Rank {rank}: generated {len(my_results)} samples", "cyan")

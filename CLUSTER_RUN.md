@@ -47,6 +47,16 @@ The cluster plumbing lives in:
 The SBATCH header (`--partition`, `--gres`, `--time`, `--mem`) in each script is
 a template — adjust it for your queue and GPU type.
 
+### Attention backend fallback
+
+The default config keeps the original FlashAttention behavior with
+`model.attn_backend=flash`. If your cluster cannot build or import
+`flash-attn`, rerun with PyTorch SDPA:
+
+```bash
+python rl.py config=configs/rl_bd3lm.yaml model.attn_backend=sdpa
+```
+
 ---
 
 ## Smoke test

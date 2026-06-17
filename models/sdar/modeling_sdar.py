@@ -45,15 +45,23 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
 from .configuration_sdar import SDARConfig
+from attention_backend import FLASH_ATTN_MISSING_ERROR
 
-from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+try:
+    from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+except ImportError:
+    flash_rms_norm = None
 
 import torch.nn.functional as F
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
-except:
-    pass
+except ImportError:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
+    index_first_axis = None
+    pad_input = None
+    unpad_input = None
 
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
@@ -81,16 +89,15 @@ class SDARRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        return flash_rms_norm(
-            hidden_states, weight=self.weight, bias=None, eps=self.variance_epsilon)
-        '''
+        if flash_rms_norm is not None:
+            return flash_rms_norm(
+                hidden_states, weight=self.weight, bias=None, eps=self.variance_epsilon)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * \
             torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-        '''
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -200,6 +207,8 @@ class SDARAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        if config._attn_implementation == "flash_attention_2" and flash_attn_func is None:
+            raise ImportError(FLASH_ATTN_MISSING_ERROR)
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
@@ -338,7 +347,12 @@ class SDARAttention(nn.Module):
 
         bsz, q_len = input_shape
 
-        if q_len == 1 and past_key_value is not None:
+        use_flash_decode = (
+            self.config._attn_implementation == "flash_attention_2"
+            and q_len == 1
+            and past_key_value is not None
+        )
+        if use_flash_decode:
             # --- Decoding: flash-attn ---
             q = query_states.transpose(1, 2)  # [B,Q,H,D]
             k = key_states.transpose(1, 2)

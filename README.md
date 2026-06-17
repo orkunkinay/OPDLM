@@ -23,7 +23,8 @@ Hugging Face collection.
 ## 1. Environment
 
 The pipeline was developed against Python 3.10 / CUDA 12.4-12.8 / PyTorch
-2.6.0+cu124. flash-attn must be installed **after** torch with
+2.6.0+cu124. FlashAttention is optional, but when using the default
+`model.attn_backend=flash`, `flash-attn` must be installed **after** torch with
 `--no-build-isolation`, otherwise it pulls its own torch and breaks the env.
 
 ```bash
@@ -36,8 +37,15 @@ pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu12
 # everything else
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 
-# flash-attn last
+# optional: flash-attn last, needed for model.attn_backend=flash
 pip install flash-attn==2.7.4.post1 --no-build-isolation
+```
+
+If your cluster does not expose `nvcc` or cannot build `flash-attn`, use PyTorch
+SDPA instead:
+
+```bash
+python rl.py config=configs/rl_bd3lm.yaml model.attn_backend=sdpa
 ```
 
 If `nvcc` and the torch CUDA version disagree (e.g., driver CUDA 12.8 but torch
