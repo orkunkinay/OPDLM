@@ -6,6 +6,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:h200_3g.71gb:1
 
 # Download OPDLM datasets and model assets for cluster runs.
 #
