@@ -35,8 +35,6 @@ import math
 import os
 import sys
 
-from datasets import load_dataset
-
 
 HF_REPO = "open-r1/codeforces"
 HF_CONFIG = "verifiable"
@@ -61,7 +59,20 @@ def _normalize_text(s: str) -> str:
 
 def _normalize_io(s: str) -> str:
     """Strip CRLF in tests so stdin lines match what `input()` returns."""
-    return s.replace("\r\n", "\n").replace("\r", "\n") if s else s
+    if s is None:
+        return ""
+    return str(s).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _text_field(value) -> str:
+    """Return a stripped string for optional dataset text fields."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _statement_field(value) -> str:
+    return _normalize_text(_text_field(value))
 
 
 def build_question(row: dict) -> str:
@@ -73,39 +84,48 @@ def build_question(row: dict) -> str:
     prompt, the latter include all hidden cases.
     """
     parts = []
-    title = row.get("title")
+    title = _text_field(row.get("title"))
     if title:
-        parts.append(title.strip())
+        parts.append(title)
         parts.append("")  # blank line after title
 
-    parts.append(_normalize_text(row["description"].strip()))
+    description = _statement_field(row.get("description"))
+    if description:
+        parts.append(description)
 
-    if row.get("input_format"):
+    input_format = _statement_field(row.get("input_format"))
+    if input_format:
         parts.append("")
         parts.append("Input")
-        parts.append(_normalize_text(row["input_format"].strip()))
+        parts.append(input_format)
 
-    if row.get("output_format"):
+    output_format = _statement_field(row.get("output_format"))
+    if output_format:
         parts.append("")
         parts.append("Output")
-        parts.append(_normalize_text(row["output_format"].strip()))
+        parts.append(output_format)
 
     examples = row.get("examples") or []
     if examples:
-        parts.append("")
-        parts.append("Examples")
-        for i, ex in enumerate(examples, 1):
+        example_parts = []
+        for ex in examples:
+            if not isinstance(ex, dict):
+                continue
+            ex_input = _normalize_io(ex.get("input")).rstrip()
+            ex_output = _normalize_io(ex.get("output")).rstrip()
+            if not ex_input and not ex_output:
+                continue
+            example_parts.extend(["", "Input", ex_input, "Output", ex_output])
+        if example_parts:
             parts.append("")
-            parts.append(f"Input")
-            parts.append(ex["input"].rstrip())
-            parts.append(f"Output")
-            parts.append(ex["output"].rstrip())
+            parts.append("Examples")
+            parts.extend(example_parts)
 
-    note = row.get("note")
+    note = _statement_field(row.get("note"))
     if note:
         parts.append("")
         parts.append("Note")
-        parts.append(_normalize_text(note.strip()))
+        parts.append(note)
 
     return "\n".join(parts).strip()
 
@@ -120,6 +140,7 @@ def keep_row(row: dict) -> bool:
         / multiple-correct-answers cases that need a checker script)
       - problems flagged not-executable
       - problems missing official_tests
+      - problems missing a statement body
     """
     if row.get("input_mode") != "stdio":
         return False
@@ -131,6 +152,8 @@ def keep_row(row: dict) -> bool:
         return False
     tests = row.get("official_tests") or []
     if not tests:
+        return False
+    if not _text_field(row.get("description")):
         return False
     return True
 
@@ -159,6 +182,8 @@ def convert(row: dict) -> dict:
 
 
 def process_split(split: str, max_n: int | None) -> list[dict]:
+    from datasets import load_dataset
+
     print(f"[codeforces] loading {HF_REPO}:{HF_CONFIG} split={split} ...")
     ds = load_dataset(HF_REPO, HF_CONFIG, split=split)
     n_total = len(ds)
