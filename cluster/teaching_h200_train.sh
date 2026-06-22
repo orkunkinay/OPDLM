@@ -6,7 +6,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:h200_3g.71gb:1
+#SBATCH --gres=gpu:h200:1
 #SBATCH --signal=USR1@300
 
 # Slurm launcher for this repo on the Teaching H200 MIG partition.
