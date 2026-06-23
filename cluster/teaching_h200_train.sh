@@ -47,11 +47,20 @@ echo "Start time: $(date)"
 echo "Working dir: $(pwd)"
 echo "===================="
 
-if [ -f .venv/bin/activate ]; then
+if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
+  source /opt/conda/etc/profile.d/conda.sh
+  conda activate opdlm
+elif [ -f .venv/bin/activate ]; then
   source .venv/bin/activate
+elif [ -f venv/bin/activate ]; then
+  source venv/bin/activate
 else
-  echo "WARNING: .venv/bin/activate not found in $(pwd); using current Python environment"
+  echo "ERROR: No Python environment found."
+  exit 1
 fi
+
+echo "Python: $(which python)"
+python -c "import torch, numpy; print('torch', torch.__version__); print('cuda', torch.cuda.is_available())"
 
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
