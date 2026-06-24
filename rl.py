@@ -37,6 +37,29 @@ def _eval_dataset_is_code(ds_name):
     return cfg.get("domain") == "code"
 
 
+def _dataset_path(dataset_name):
+    dataset_name = str(dataset_name)
+    cfg = _EVAL_DATASET_CONFIGS.get(dataset_name, {})
+    rel_path = cfg.get("path", f"{dataset_name}.json")
+    path = rel_path if os.path.isabs(rel_path) else os.path.join("data", rel_path)
+    if os.path.exists(path):
+        return path
+
+    hint = (
+        "Download the datasets with:\n"
+        "  huggingface-cli download divelab/opdlm_eval_data --local-dir data/ --repo-type dataset\n"
+        "  huggingface-cli download divelab/opdlm_train_data --local-dir data/ --repo-type dataset"
+    )
+    if dataset_name == "MATH_train":
+        hint += (
+            "\n\nThe bundled math post-training dataset is MATH_train_traceRL.json. "
+            "Use dataset.train_dataset=MATH_train_traceRL unless you have created data/MATH_train.json yourself."
+        )
+    raise FileNotFoundError(
+        f"Training dataset '{dataset_name}' was not found at {path!r} from cwd {os.getcwd()!r}.\n{hint}"
+    )
+
+
 def get_config():
     cli_conf = OmegaConf.from_cli()
     yaml_conf = OmegaConf.load(cli_conf.config)
@@ -195,7 +218,7 @@ if __name__ == "__main__":
     # ── Compute total_step early (needed by LR scheduler in init_training) ──
     _num_train_epochs_early = config.dataset.get("num_data_epochs", -1)
     if _num_train_epochs_early >= 1:
-        _train_data_path_early = f"data/{config.dataset.train_dataset}.json"
+        _train_data_path_early = _dataset_path(config.dataset.train_dataset)
         with open(_train_data_path_early, 'r') as f:
             _n_samples_early = len(json.load(f))
         _chunk_size_early = config.rollout.num_task_per_step
@@ -263,7 +286,7 @@ if __name__ == "__main__":
     _chunk_size = config.rollout.num_task_per_step
 
     if _epoch_mode:
-        train_data_path = f"data/{config.dataset.train_dataset}.json"
+        train_data_path = _dataset_path(config.dataset.train_dataset)
         if is_main:
             print(f"Epoch mode: loading {train_data_path} ...")
         with open(train_data_path, 'r') as f:

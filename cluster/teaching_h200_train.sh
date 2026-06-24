@@ -116,6 +116,8 @@ TEACHER=${TEACHER:-}
 WANDB_ENABLED=${WANDB_ENABLED:-true}
 EXPERIMENT_PORT=${EXPERIMENT_PORT:-29500}
 ROLLOUT_BASE_PORT=${ROLLOUT_BASE_PORT:-29000}
+DATA_DIR=${DATA_DIR:-data}
+HF_DATA_AUTO_DOWNLOAD=${HF_DATA_AUTO_DOWNLOAD:-true}
 
 LOCAL_STUDENT="$MODEL_ROOT/BD3LM/Qwen3-${MODEL_SIZE}-a2d-init"
 LOCAL_TEACHER="$MODEL_ROOT/Qwen/Qwen3-${MODEL_SIZE}"
@@ -134,12 +136,82 @@ if [ -n "$TEACHER" ]; then
   EXTRA_ARGS+=("model.teacher_model=$TEACHER")
 fi
 
+TRAIN_DATASET="MATH_train_traceRL"
+EVAL_DATASET="MATH500"
+for arg in "$@"; do
+  case "$arg" in
+    dataset.train_dataset=*) TRAIN_DATASET="${arg#dataset.train_dataset=}" ;;
+    evaluation.eval_dataset=*) EVAL_DATASET="${arg#evaluation.eval_dataset=}" ;;
+  esac
+done
+
+download_dataset_repo() {
+  local repo="$1"
+  if [ "$HF_DATA_AUTO_DOWNLOAD" != "true" ]; then
+    return 0
+  fi
+  if ! command -v huggingface-cli >/dev/null 2>&1; then
+    echo "ERROR: $DATA_DIR is missing data and huggingface-cli is not available."
+    echo "Install huggingface_hub in this environment, or run cluster/setup_assets.sh before submitting."
+    exit 1
+  fi
+  echo "Downloading $repo into $DATA_DIR ..."
+  huggingface-cli download "$repo" --local-dir "$DATA_DIR" --repo-type dataset
+}
+
+ensure_dataset_file() {
+  local dataset="$1"
+  dataset="${dataset//\"/}"
+  dataset="${dataset//\'/}"
+  dataset="${dataset#"${dataset%%[![:space:]]*}"}"
+  dataset="${dataset%"${dataset##*[![:space:]]}"}"
+  if [ -z "$dataset" ]; then
+    return 0
+  fi
+  local file="$DATA_DIR/${dataset}.json"
+  if [ -f "$file" ]; then
+    echo "Found dataset: $file"
+    return 0
+  fi
+
+  mkdir -p "$DATA_DIR"
+  case "$dataset" in
+    opdlm_train)
+      download_dataset_repo "divelab/opdlm_train_data"
+      ;;
+    MATH_train)
+      echo "ERROR: $file is missing, and the OPDLM download does not provide MATH_train.json."
+      echo "Use dataset.train_dataset=MATH_train_traceRL for the bundled math post-training data."
+      exit 1
+      ;;
+    *)
+      download_dataset_repo "divelab/opdlm_eval_data"
+      ;;
+  esac
+
+  if [ ! -f "$file" ]; then
+    echo "ERROR: Dataset file is still missing after setup: $file"
+    echo "Check DATA_DIR, HF_TOKEN, and the dataset name passed to the job."
+    exit 1
+  fi
+  echo "Found dataset after setup: $file"
+}
+
+ensure_dataset_file "$TRAIN_DATASET"
+IFS=',' read -ra EVAL_DATASETS <<< "${EVAL_DATASET#[}"
+for eval_ds in "${EVAL_DATASETS[@]}"; do
+  ensure_dataset_file "${eval_ds%]}"
+done
+
 mkdir -p "$RUN_DIR"
 echo "Run dir: $RUN_DIR"
 echo "Accelerate config: $ACCEL_CONFIG"
 echo "Model size selector: $MODEL_SIZE"
 echo "Student override: ${STUDENT:-using config default}"
 echo "Teacher override: ${TEACHER:-using config default}"
+echo "Data dir: $DATA_DIR"
+echo "Train dataset: $TRAIN_DATASET"
+echo "Eval dataset: $EVAL_DATASET"
 
 accelerate launch \
   --num_machines 1 \

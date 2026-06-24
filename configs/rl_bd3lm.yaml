@@ -40,7 +40,7 @@ model:
 
 
 dataset:
-    train_dataset: "MATH_train" # "MATH_train""PrimeIntellect"
+    train_dataset: "MATH_train_traceRL" # use opdlm_train for general pre-training
     optimization_data: "rl_data" # name of the rollout data output
     data_type: "math" # "math" "code"
     offline_data: null  # path to pre-collected data, e.g. "data/teacher_MATH_train_k4_correct.json"
